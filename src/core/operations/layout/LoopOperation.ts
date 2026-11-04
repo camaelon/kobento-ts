@@ -1,0 +1,98 @@
+// LoopOperation: repeats child operations for a range of values.
+// Binary: [indexId:INT] [from:FLOAT] [step:FLOAT] [until:FLOAT]
+// Container: children follow, terminated by ContainerEnd.
+
+import { Operation } from '../../Operation';
+import type { WireBuffer } from '../../WireBuffer';
+import type { RemoteContext } from '../../RemoteContext';
+import { ContextMode } from '../../RemoteContext';
+import { isNaNBits, idFromBits, intBitsToFloat } from '../Utils';
+
+export class LoopOperation extends Operation {
+    static readonly OP_CODE = 215;
+
+    private mIndexId: number;
+    // Raw float32 int bits of from/step/until (NaN-with-payload => variable ref).
+    private mFromBits: number;
+    private mStepBits: number;
+    private mUntilBits: number;
+    private mList: Operation[] = [];
+
+    constructor(indexId: number, fromBits: number, stepBits: number, untilBits: number) {
+        super();
+        this.mIndexId = indexId; this.mFromBits = fromBits;
+        this.mStepBits = stepBits; this.mUntilBits = untilBits;
+    }
+
+    getList(): Operation[] { return this.mList; }
+
+    write(_buffer: WireBuffer): void { /* stub */ }
+
+    apply(context: RemoteContext): void {
+        if (context.mMode === ContextMode.DATA) {
+            // During data pass, just apply children once to register variables
+            for (const op of this.mList) {
+                context.incrementOpCount(op);
+                op.apply(context);
+            }
+            return;
+        }
+
+        const from = this.rv(this.mFromBits, context);
+        const step = this.rv(this.mStepBits, context);
+        const until = this.rv(this.mUntilBits, context);
+
+        if (step <= 0 || !isFinite(from) || !isFinite(until) || !isFinite(step)) return;
+
+        if (this.mIndexId === 0) {
+            for (let i = from; i < until; i += step) {
+                // One count per iteration for the loop itself, as the reference does
+                // (LoopOperation.java:126 / :135) — so a loop's cost scales with its
+                // iteration count even when its body is empty.
+                context.incrementOpCount(this);
+                for (const op of this.mList) {
+                    context.incrementOpCount(op);
+                    op.apply(context);
+                }
+            }
+        } else {
+            for (let i = from; i < until; i += step) {
+                context.loadFloat(this.mIndexId, i);
+                context.incrementOpCount(this);
+                for (const op of this.mList) {
+                    // Refresh only what is dirty, as the reference does. Recomputing
+                    // every operation on every iteration is not merely wasteful: an
+                    // operation the engine considers clean keeps the values it resolved
+                    // earlier, and re-resolving it against the current loop index gives
+                    // a different answer.
+                    if (op.isDirty() && typeof (op as any).updateVariables === 'function') {
+                        (op as any).updateVariables(context);
+                    }
+                    context.incrementOpCount(op);
+                    op.apply(context);
+                }
+            }
+        }
+    }
+
+    getIndexId(): number { return this.mIndexId; }
+    getFrom(ctx: RemoteContext): number { return this.rv(this.mFromBits, ctx); }
+    getStep(ctx: RemoteContext): number { return this.rv(this.mStepBits, ctx); }
+    getUntil(ctx: RemoteContext): number { return this.rv(this.mUntilBits, ctx); }
+
+    private rv(bits: number, ctx: RemoteContext): number {
+        return isNaNBits(bits) ? ctx.getFloat(idFromBits(bits)) : intBitsToFloat(bits);
+    }
+
+    deepToString(indent: string): string {
+        return `${indent}LoopOperation(${intBitsToFloat(this.mFromBits)}..${intBitsToFloat(this.mUntilBits)} step ${intBitsToFloat(this.mStepBits)})`;
+    }
+
+    static read(buffer: WireBuffer, operations: Operation[]): void {
+        const indexId = buffer.readId();
+        const from = buffer.readNanIdBits();   // raw bits; NaN-with-payload => variable ref
+        const step = buffer.readNanIdBits();
+        const until = buffer.readNanIdBits();
+        operations.push(new LoopOperation(indexId, from, step, until));
+    }
+}

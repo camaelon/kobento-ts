@@ -1,0 +1,2540 @@
+// CanvasPaintContext: concrete PaintContext that renders to an HTML5 Canvas 2D.
+
+import { PaintContext } from '../core/PaintContext';
+import { SoftwarePaint3DContext, createCanvasMesh } from '../core/d3/SoftwarePaint3DContext';
+import type { CanvasMesh } from '../core/d3/SoftwarePaint3DContext';
+import { WebGL3DRenderer } from './WebGL3DRenderer';
+import {
+    MODE_BACKEND_CANVAS, MODE_BACKEND_CANVAS_ZBUF, MODE_SMOOTH_MASK, MODE_WIREFRAME,
+} from '../core/d3/Paint3DContext';
+import type { RemoteContext } from '../core/RemoteContext';
+import { SoftwarePaint3DContext } from '../core/d3/SoftwarePaint3DContext';
+import { PaintBundle, intBitsToFloat } from '../core/operations/paint/PaintBundle';
+import { isNaNBits, idFromBits, floatToRawIntBits } from '../core/operations/Utils';
+import { transpileAgslToGlsl } from '../core/shader/AgslTranspiler';
+import { WebGLShaderRenderer } from './shader/WebGLShaderRenderer';
+import type { ShaderData } from '../core/operations/ShaderData';
+import { BLEND_MODULATE as MESH_BLEND_MODULATE, sampleFrame as meshSampleFrame,
+         buildMatrix as meshBuildMatrix } from '../core/operations/Mesh2DGenerator';
+
+function argbToRgba(argb: number): string {
+    const a = ((argb >>> 24) & 0xFF) / 255;
+    const r = (argb >>> 16) & 0xFF;
+    const g = (argb >>> 8) & 0xFF;
+    const b = argb & 0xFF;
+    return `rgba(${r},${g},${b},${a.toFixed(3)})`;
+}
+
+/** Fallback text size when the paint carries none. */
+// A decoded path segment in absolute coordinates (see CanvasPaintContext.decodePath).
+type PathSeg = ['M', number, number] | ['L', number, number, number, number]
+    | ['Q', number, number, number, number, number, number]
+    | ['C', number, number, number, number, number, number, number, number] | ['Z'];
+
+// One drawing piece of a measured contour: control points from its start point on
+// (2 for a line, 3 for a quad, 4 for a cubic), with a cumulative arc-length table.
+interface MeasuredPiece { pts: number[]; len: number; cum: Float64Array | null; }
+
+const TRIM_STEPS = 32;
+
+function evalBezier(pts: number[], t: number): [number, number] {
+    // de Casteljau over 2..4 points, returns the point at t
+    const xs: number[] = [], ys: number[] = [];
+    for (let k = 0; k < pts.length; k += 2) { xs.push(pts[k]); ys.push(pts[k + 1]); }
+    for (let n = xs.length - 1; n > 0; n--) {
+        for (let k = 0; k < n; k++) {
+            xs[k] += (xs[k + 1] - xs[k]) * t;
+            ys[k] += (ys[k + 1] - ys[k]) * t;
+        }
+    }
+    return [xs[0], ys[0]];
+}
+
+// The part of a Bezier between t0 and t1 (0 <= t0 <= t1 <= 1), same degree.
+function subBezier(pts: number[], t0: number, t1: number): number[] {
+    const split = (p: number[], t: number, left: boolean): number[] => {
+        const n = p.length / 2;
+        const xs: number[] = [], ys: number[] = [];
+        for (let k = 0; k < n; k++) { xs.push(p[2 * k]); ys.push(p[2 * k + 1]); }
+        const lx = [xs[0]], ly = [ys[0]], rx = [xs[n - 1]], ry = [ys[n - 1]];
+        for (let m = n - 1; m > 0; m--) {
+            for (let k = 0; k < m; k++) {
+                xs[k] += (xs[k + 1] - xs[k]) * t;
+                ys[k] += (ys[k + 1] - ys[k]) * t;
+            }
+            lx.push(xs[0]); ly.push(ys[0]); rx.push(xs[m - 1]); ry.push(ys[m - 1]);
+        }
+        const out: number[] = [];
+        if (left) for (let k = 0; k < n; k++) out.push(lx[k], ly[k]);
+        else for (let k = n - 1; k >= 0; k--) out.push(rx[k], ry[k]);
+        return out;
+    };
+    let p = t1 < 1 ? split(pts, t1, true) : pts;
+    if (t0 > 0) p = split(p, t1 > 0 ? t0 / t1 : 0, false);
+    return p;
+}
+
+function measurePiece(pts: number[]): MeasuredPiece {
+    if (pts.length === 4) {
+        return { pts, len: Math.hypot(pts[2] - pts[0], pts[3] - pts[1]), cum: null };
+    }
+    const cum = new Float64Array(TRIM_STEPS + 1);
+    let [px, py] = [pts[0], pts[1]];
+    for (let k = 1; k <= TRIM_STEPS; k++) {
+        const [x, y] = evalBezier(pts, k / TRIM_STEPS);
+        cum[k] = cum[k - 1] + Math.hypot(x - px, y - py);
+        px = x; py = y;
+    }
+    return { pts, len: cum[TRIM_STEPS], cum };
+}
+
+// Distance along a piece (0..len) to its curve parameter t.
+function pieceT(m: MeasuredPiece, d: number): number {
+    if (m.len <= 0) return 0;
+    if (!m.cum) return Math.min(1, Math.max(0, d / m.len));
+    const cum = m.cum;
+    let k = 1;
+    while (k < TRIM_STEPS && cum[k] < d) k++;
+    const span = cum[k] - cum[k - 1];
+    const frac = span > 0 ? (d - cum[k - 1]) / span : 0;
+    return Math.min(1, Math.max(0, (k - 1 + frac) / TRIM_STEPS));
+}
+
+// The pieces of the first contour that has a length, as android.graphics.PathMeasure
+// (Skia's SkContourMeasureIter, forceClosed = false) sees them: a contour begins at a
+// moveTo (or at the last moveTo point / the origin when drawing starts without one), a
+// close adds the line back to that point and ends the contour.
+function firstContour(segs: PathSeg[]): MeasuredPiece[] {
+    let pieces: MeasuredPiece[] = [];
+    let total = 0;
+    let mx = 0, my = 0, cx = 0, cy = 0;
+    const flush = (): boolean => total > 0;
+    const add = (pts: number[]) => { const m = measurePiece(pts); pieces.push(m); total += m.len; };
+    for (const s of segs) {
+        switch (s[0]) {
+            case 'M':
+                if (flush()) return pieces;
+                pieces = []; total = 0;
+                mx = cx = s[1]; my = cy = s[2];
+                break;
+            case 'L': add([cx, cy, s[3], s[4]]); cx = s[3]; cy = s[4]; break;
+            case 'Q': add([cx, cy, s[3], s[4], s[5], s[6]]); cx = s[5]; cy = s[6]; break;
+            case 'C': add([cx, cy, s[3], s[4], s[5], s[6], s[7], s[8]]); cx = s[7]; cy = s[8]; break;
+            case 'Z':
+                add([cx, cy, mx, my]);
+                cx = mx; cy = my;
+                if (flush()) return pieces;
+                pieces = []; total = 0;
+                break;
+        }
+    }
+    return flush() ? pieces : [];
+}
+
+// PathMeasure.getSegment(start * len, stop * len, dst, startWithMoveTo = true) over the
+// first contour; 0 <= start < stop <= 1.
+function trimPathSegs(segs: PathSeg[], start: number, stop: number): Path2D {
+    const out = new Path2D();
+    const pieces = firstContour(segs);
+    let total = 0;
+    for (const m of pieces) total += m.len;
+    if (total <= 0) return out;
+    const d0 = start * total, d1 = stop * total;
+    let acc = 0, started = false;
+    for (const m of pieces) {
+        const a = acc, b = acc + m.len;
+        acc = b;
+        if (m.len <= 0 || b < d0 || a > d1) continue;
+        const t0 = pieceT(m, Math.max(0, d0 - a));
+        const t1 = pieceT(m, Math.min(m.len, d1 - a));
+        if (t1 < t0) continue;
+        const p = subBezier(m.pts, t0, t1);
+        if (!started) { out.moveTo(p[0], p[1]); started = true; }
+        if (p.length === 4) out.lineTo(p[2], p[3]);
+        else if (p.length === 6) out.quadraticCurveTo(p[2], p[3], p[4], p[5]);
+        else out.bezierCurveTo(p[2], p[3], p[4], p[5], p[6], p[7]);
+        if (b >= d1) break;
+    }
+    return out;
+}
+
+const DEFAULT_TEXT_SIZE = 14;
+/** Ascent / descent as fractions of the text size — roughly Roboto's, i.e. a phone's. */
+const ASCENT_RATIO = 0.92;
+const DESCENT_RATIO = 0.24;
+/** Mean advance per character as a fraction of text size, measured on a device. */
+const AVG_ADVANCE = 0.528;
+
+// One animated bitmap as it streams: the decoder kept open, the frame showing, and when
+// the document's clock passes the end of it.
+interface AnimatedBitmap {
+    decoder: any;            // WebCodecs ImageDecoder
+    count: number;
+    index: number;           // the frame showing, -1 before the first lands
+    frame: VideoFrame | null;   // drawn as it comes from the decoder; no bitmap in between
+    frameEnds: number;       // document seconds at which the frame showing ends
+    decoding: boolean;
+    failed: boolean;
+}
+
+export class CanvasPaintContext extends PaintContext {
+    private ctx: CanvasRenderingContext2D;
+
+    // Current paint state
+    private color = 'rgba(0,0,0,1)';
+    /** The same paint color as a packed ARGB int — what drawMesh3D shades with. */
+    private colorArgb = 0xFF000000 | 0;
+    private style = 0; // 0=FILL, 1=STROKE, 2=FILL_AND_STROKE
+    private strokeWidth = 1;
+    private textSize = 14;
+    private alpha = 1;
+    private lineCap: CanvasLineCap = 'butt';
+    private lineJoin: CanvasLineJoin = 'miter';
+    private miterLimit = 10;
+    private blendMode: GlobalCompositeOperation = 'source-over';
+    private antiAlias = true;
+    private filterBitmap = true;
+    private letterSpacing = 0;
+    private gradientStyle: CanvasGradient | CanvasPattern | null = null;
+    // The geometry the gradient was built from, kept so it can be rebuilt in a
+    // transformed space. A CanvasGradient resolves against the user space in force when
+    // it is USED, and text on a path is filled one glyph at a time inside a translate +
+    // rotate — so the gradient has to be re-expressed per glyph. See fillStyleUnderGlyph.
+    private gradientSpec: {
+        kind: 'sweep' | 'radial' | 'linear';
+        colors: number[]; stops: number[];
+        cx: number; cy: number; radius: number;
+        x1: number; y1: number; x2: number; y2: number;
+    } | null = null;
+    private fontFamily = 'sans-serif';
+    private fontWeight = 400;
+    private fontItalic = false;
+    private colorFilterColor: string | null = null;
+    private colorFilterArgb = 0;
+    private colorFilterMode = 3; // SRC_OVER default
+
+    // Active shader (set via PaintBundle.SHADER)
+    private activeShaderData: ShaderData | null = null;
+    private shaderRenderer: WebGLShaderRenderer | null = null;
+
+    /** Release the WebGL context this paint context lazily created, if any. */
+    destroy(): void {
+        if (this.shaderRenderer) {
+            this.shaderRenderer.destroy();
+            this.shaderRenderer = null;
+        }
+    }
+    private glslCache = new Map<number, string>();  // shaderTextId -> transpiled GLSL
+
+    // Paint stack for save/restore
+    private paintStack: Array<{
+        color: string; style: number; strokeWidth: number; textSize: number;
+        alpha: number; lineCap: CanvasLineCap; lineJoin: CanvasLineJoin;
+        miterLimit: number; blendMode: GlobalCompositeOperation; antiAlias: boolean;
+        letterSpacing: number; gradientStyle: CanvasGradient | CanvasPattern | null;
+        fontFamily: string; fontWeight: number; fontItalic: boolean;
+        filterBitmap: boolean;
+        colorFilterColor: string | null; colorFilterArgb: number; colorFilterMode: number;
+        activeShaderData: ShaderData | null;
+    }> = [];
+
+    // Path cache: id -> Int32Array (raw float32 int bits; markers/variable refs
+    // are NaN-with-payload — decoded from bits, never via Number.isNaN, so the
+    // ids survive on engines that canonicalize NaN payloads (Safari/Firefox)).
+    private pathDataCache = new Map<number, Int32Array>();
+    private pathWindingCache = new Map<number, number>();
+
+    // Bitmap cache: id -> ImageBitmap or HTMLImageElement
+    private bitmapCache = new Map<number, HTMLImageElement | ImageBitmap>();
+    // Animated bitmaps (a GIF embedded whole), streamed: one frame decoded at a time, the
+    // next asked for when the document's clock passes the end of the one showing. A long
+    // GIF at full size is hundreds of megabytes as bitmaps, so nothing is decoded ahead —
+    // the C++ player streams through one working buffer for the same reason.
+    private animatedBitmaps = new Map<number, AnimatedBitmap>();
+    private disposed = false;
+    // Bitmaps a host has supplied as video instead: a GIF transcoded once at export time,
+    // decoded by the browser's own video pipeline and drawn frame by frame from the element.
+    // Far cheaper than decoding GIF frames, and the preferred way to animate a bitmap.
+    private bitmapVideos = new Map<number, HTMLVideoElement>();
+
+    /// One stored 2D mesh. Canvas2D has no drawVertices, so drawMesh walks the triangle list.
+    private meshCache = new Map<number, {
+        layout: number; uCount: number; vCount: number;
+        verts: Float32Array; uv: Float32Array; colors: Int32Array; indices: Int32Array;
+    }>();
+    private bitmapPromises = new Map<number, Promise<void>>();
+    /** Bitmaps converted to ARGB for 3D texturing, kept so the readback happens once. */
+    private texturePixels = new Map<number, { argb: Int32Array; width: number; height: number }>();
+
+    // Text cache: id -> string
+    private textCache = new Map<number, string>();
+
+    // Graphics layer stack for offscreen compositing
+    private layerStack: Array<{
+        previousCtx: CanvasRenderingContext2D;
+        offscreenCanvas: any;
+        width: number;
+        height: number;
+        attributes: Map<number, any>;
+    }> = [];
+
+    // Factory for creating offscreen canvases - override for node-canvas
+    createLayerCanvas: (w: number, h: number) => CanvasRenderingContext2D = (w, h) => {
+        if (typeof OffscreenCanvas !== 'undefined') {
+            const c = new OffscreenCanvas(w, h);
+            return c.getContext('2d')! as unknown as CanvasRenderingContext2D;
+        }
+        if (typeof document !== 'undefined') {
+            const c = document.createElement('canvas');
+            c.width = w;
+            c.height = h;
+            return c.getContext('2d')!;
+        }
+        throw new Error('No canvas factory available for graphics layers');
+    };
+
+    constructor(context: RemoteContext, canvas: CanvasRenderingContext2D) {
+        super(context);
+        if (!canvas) {
+            throw new Error('CanvasPaintContext: canvas rendering context is null or undefined');
+        }
+        this.ctx = canvas;
+    }
+
+    getCanvas(): CanvasRenderingContext2D { return this.ctx; }
+    // An embedded document paints on whatever canvas its host is painting on, which can
+    // change between frames (a resize, a new host document on the same page).
+    setCanvas(canvas: CanvasRenderingContext2D): void { this.ctx = canvas; }
+
+    // --- Text cache ---
+
+    loadText(id: number, text: string): void { this.textCache.set(id, text); }
+
+    getText(id: number): string | null { return this.textCache.get(id) ?? null; }
+
+    // --- Bitmap cache ---
+
+    loadBitmap(imageId: number, encoding: number, type: number,
+               width: number, height: number, bitmap: Uint8Array): void {
+        // A bitmap's data operation is applied on every paint's data pass, with the same
+        // bytes each time. Decoding once is enough — and for an animated one, essential: a
+        // fresh decoder every frame is one that never gets to its first picture.
+        if (this.bitmapPromises.has(imageId)) return;
+        // ENCODING_EMPTY (3) and ENCODING_COMPONENT_OFFSCREEN_BUFFER (4) carry dimensions
+        // and no pixels — they exist to be drawn into, not decoded. Handing their empty
+        // payload to an <img> fails asynchronously and logs "failed to load bitmap N" on
+        // every document that uses an offscreen buffer, which reads like a real error.
+        // Record the size so drawToBitmap can allocate the surface at the declared
+        // resolution instead of falling back to its 256x256 default.
+        if (encoding === 3 || encoding === 4 || bitmap.length === 0) {
+            // Only ENCODING_EMPTY carries a real size. The component offscreen buffer
+            // writes 1x1 as a placeholder and takes its size from the component at paint
+            // time, so recording that would allocate a one-pixel buffer.
+            if (encoding === 3) this.emptyBitmapSizes.set(imageId, { width, height });
+            return;
+        }
+        // A GIF: an <img> would draw its first frame forever, so its frames are decoded
+        // separately where the browser can (WebCodecs' ImageDecoder), and the <img> below
+        // stays as the still to show until they are, or on a browser that cannot.
+        const isGif = bitmap.length > 6 && bitmap[0] === 0x47 && bitmap[1] === 0x49
+                      && bitmap[2] === 0x46 && bitmap[3] === 0x38;
+        if (isGif && !this.bitmapVideos.has(imageId)
+            && typeof (globalThis as any).ImageDecoder !== 'undefined') {
+            this.loadAnimatedBitmap(imageId, bitmap);
+        }
+        // Decode bitmap asynchronously and cache
+        const blob = new Blob([bitmap.buffer as ArrayBuffer], { type: 'image/png' });
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        const promise = new Promise<void>((resolve) => {
+            img.onload = () => {
+                URL.revokeObjectURL(url);
+                this.bitmapCache.set(imageId, img);
+                resolve();
+            };
+            img.onerror = (e) => {
+                URL.revokeObjectURL(url);
+                console.warn(`CanvasPaintContext: failed to load bitmap ${imageId}`, e);
+                resolve();
+            };
+            img.src = url;
+        });
+        this.bitmapPromises.set(imageId, promise);
+    }
+
+    // `videos` maps image ids to video URLs. Called before the document's data pass, so a
+    // bitmap with a video never starts a GIF decoder.
+    setBitmapVideos(videos: Record<string, string> | Map<number, string> | null): void {
+        for (const v of this.bitmapVideos.values()) { v.pause(); v.removeAttribute('src'); v.load(); v.remove(); }
+        this.bitmapVideos.clear();
+        if (!videos || typeof document === 'undefined') return;
+        const entries: Array<[number, string]> = videos instanceof Map
+            ? [...videos.entries()]
+            : Object.entries(videos).map(([k, v]) => [Number(k), v] as [number, string]);
+        for (const [id, url] of entries) {
+            const video = document.createElement('video');
+            video.muted = true;
+            video.loop = true;
+            video.playsInline = true;
+            video.preload = 'auto';
+            video.src = url;
+            // In the document, out of sight: a detached video element is loaded lazily and
+            // played reluctantly; one on the page, however small, streams like any other.
+            video.style.cssText = 'position:fixed;left:-4px;top:-4px;width:2px;height:2px;opacity:0;pointer-events:none';
+            document.body.appendChild(video);
+            video.play().catch(() => { /* until the page has been clicked */ });
+            this.bitmapVideos.set(id, video);
+        }
+    }
+
+    private async loadAnimatedBitmap(imageId: number, bytes: Uint8Array): Promise<void> {
+        try {
+            const Decoder = (globalThis as any).ImageDecoder;
+            const decoder = new Decoder({ data: bytes, type: 'image/gif' });
+            await decoder.tracks.ready;
+            const track = decoder.tracks.selectedTrack;
+            const count: number = track ? track.frameCount : 0;
+            if (count < 2 || this.disposed) { decoder.close(); return; }
+            const anim: AnimatedBitmap = { decoder, count, index: -1, frame: null, frameEnds: 0,
+                                           decoding: false, failed: false };
+            this.animatedBitmaps.set(imageId, anim);
+            this.needsRepaint();
+        } catch (e) {
+            console.warn(`CanvasPaintContext: cannot animate bitmap ${imageId}`, e);
+        }
+    }
+
+    // Decode the frame after the one showing, and make it the one showing when it lands.
+    // One decode in flight at a time: a clock that has run ahead is not chased through the
+    // frames in between (a GIF's frames build on each other, so every one would cost), the
+    // picture just plays late until it catches up.
+    private advanceAnimated(anim: AnimatedBitmap, now: number): void {
+        if (anim.decoding || anim.failed || anim.count < 1) return;
+        anim.decoding = true;
+        const next = (anim.index + 1) % anim.count;
+        anim.decoder.decode({ frameIndex: next }).then((result: any) => {
+            const image: VideoFrame = result.image;
+            // Durations come in microseconds; a frame that says nothing (or too little to
+            // see) gets the 100 ms browsers give such GIFs.
+            let seconds = (image.duration ?? 0) / 1e6;
+            if (!(seconds >= 0.02)) seconds = 0.1;
+            if (this.disposed) { image.close(); return; }
+            if (anim.frame) anim.frame.close();
+            anim.frame = image;
+            anim.index = next;
+            // The new frame lasts from now (or from when the last one ended, if that was a
+            // moment ago) rather than from a start the clock is far past.
+            anim.frameEnds = Math.max(now, anim.frameEnds) + seconds;
+            anim.decoding = false;
+            this.needsRepaint();
+        }).catch((e: unknown) => {
+            anim.failed = true;
+            anim.decoding = false;
+            console.warn('CanvasPaintContext: animated bitmap frame failed', e);
+        });
+    }
+
+    // The bitmap to draw now: for an animated one, the frame the document's clock is on —
+    // the next one is asked for once the clock passes the end of this one — and a repaint
+    // asked for so it follows.
+    private bitmapToDraw(imageId: number): CanvasImageSource | undefined {
+        // An offscreen buffer is backed by a canvas, not by a decoded image, so it lives in
+        // a different cache. Without this a document that renders into a buffer with
+        // `drawToBitmap` and then blits it with `drawBitmap` draws nothing at all: the id
+        // resolves, the lookup misses, and the draw silently returns. The shader path
+        // already consults this cache first (see the texture uniforms in tryRenderShader),
+        // so before this the same buffer was reachable from a shader but not from a blit.
+        const offscreen = this.bitmapCanvasCache.get(imageId);
+        if (offscreen) return offscreen.canvas as CanvasImageSource;
+        const video = this.bitmapVideos.get(imageId);
+        if (video) {
+            this.needsRepaint();
+            if (video.readyState >= 2 && video.videoWidth > 0) {
+                if (video.paused) video.play().catch(() => {});
+                return video;
+            }
+            return this.bitmapCache.get(imageId);     // the still, until the video is ready
+        }
+        const anim = this.animatedBitmaps.get(imageId);
+        if (!anim) return this.bitmapCache.get(imageId);
+        const context = this.getContext();
+        const now = context ? context.getAnimationTime() : 0;
+        if (anim.index < 0 || now >= anim.frameEnds) this.advanceAnimated(anim, now);
+        this.needsRepaint();
+        return anim.frame ?? this.bitmapCache.get(imageId);
+    }
+
+    // Let go of what animated bitmaps hold — decoders and frames are not cheap, and a paint
+    // context outlives its document only as garbage.
+    dispose(): void {
+        this.disposed = true;
+        for (const v of this.bitmapVideos.values()) { v.pause(); v.removeAttribute('src'); v.load(); v.remove(); }
+        this.bitmapVideos.clear();
+        for (const anim of this.animatedBitmaps.values()) {
+            try { anim.decoder.close(); } catch { /* already closed */ }
+            if (anim.frame) anim.frame.close();
+        }
+        this.animatedBitmaps.clear();
+        for (const img of this.bitmapCache.values()) {
+            if (typeof (img as ImageBitmap).close === 'function') (img as ImageBitmap).close();
+        }
+        this.bitmapCache.clear();
+    }
+
+    // --- Path cache ---
+
+    loadPathData(id: number, winding: number, data: Int32Array): void {
+        this.pathDataCache.set(id, data);
+        this.pathWindingCache.set(id, winding);
+    }
+
+    // Path command IDs (NaN-encoded in the float array)
+    // PathExpression uses short IDs (10-16), binary PathData uses NanMap IDs (0x300000+)
+    private static readonly PATH_MOVE = 10;
+    private static readonly PATH_LINE = 11;
+    private static readonly PATH_QUADRATIC = 12;
+    private static readonly PATH_CONIC = 13;
+    private static readonly PATH_CUBIC = 14;
+    private static readonly PATH_CLOSE = 15;
+    private static readonly PATH_DONE = 16;
+    // NanMap path command base (Java convention used in binary PathData)
+    private static readonly NANMAP_PATH_BASE = 0x300000;
+
+    // Decode path data into absolute segments: [op, x0, y0, ...control/end points].
+    // op: 'M' (x, y), 'L' (from, to), 'Q' (from, cp, to), 'C' (from, cp1, cp2, to), 'Z'.
+    // Conics are kept as quadratics (weight ignored), as the untrimmed path always drew them.
+    private decodePath(data: Int32Array): PathSeg[] {
+        const segs: PathSeg[] = [];
+        const f = (k: number) => intBitsToFloat(data[k]);
+        let i = 0;
+        while (i < data.length) {
+            const bits = data[i];
+            // Command codes are NaN-encoded IDs; decode from raw bits so the
+            // payload survives Safari/Firefox NaN canonicalization. Real coords
+            // (non-NaN bits) are reinterpreted as floats.
+            let cmd = isNaNBits(bits) ? idFromBits(bits) : intBitsToFloat(bits);
+            // Normalize NanMap IDs (0x300000+) to short IDs (10+)
+            if (cmd >= CanvasPaintContext.NANMAP_PATH_BASE && cmd <= CanvasPaintContext.NANMAP_PATH_BASE + 6) {
+                cmd = CanvasPaintContext.PATH_MOVE + (cmd - CanvasPaintContext.NANMAP_PATH_BASE);
+            }
+            switch (cmd) {
+                case CanvasPaintContext.PATH_MOVE:
+                    // Format: [MOVE, x, y] = 3 positions
+                    segs.push(['M', f(i + 1), f(i + 2)]);
+                    i += 3;
+                    break;
+                case CanvasPaintContext.PATH_LINE:
+                    // Format: [LINE, startX, startY, endX, endY] = 5 positions
+                    segs.push(['L', f(i + 1), f(i + 2), f(i + 3), f(i + 4)]);
+                    i += 5;
+                    break;
+                case CanvasPaintContext.PATH_QUADRATIC:
+                    // Format: [QUAD, startX, startY, cpX, cpY, endX, endY] = 7 positions
+                    segs.push(['Q', f(i + 1), f(i + 2), f(i + 3), f(i + 4), f(i + 5), f(i + 6)]);
+                    i += 7;
+                    break;
+                case CanvasPaintContext.PATH_CONIC:
+                    // Format: [CONIC, startX, startY, cpX, cpY, endX, endY, weight] = 8 positions
+                    // Approximate conic as quadratic (ignore weight)
+                    segs.push(['Q', f(i + 1), f(i + 2), f(i + 3), f(i + 4), f(i + 5), f(i + 6)]);
+                    i += 8;
+                    break;
+                case CanvasPaintContext.PATH_CUBIC:
+                    // Format: [CUBIC, startX, startY, cp1X, cp1Y, cp2X, cp2Y, endX, endY] = 9 positions
+                    segs.push(['C', f(i + 1), f(i + 2), f(i + 3), f(i + 4), f(i + 5), f(i + 6), f(i + 7), f(i + 8)]);
+                    i += 9;
+                    break;
+                case CanvasPaintContext.PATH_CLOSE:
+                    segs.push(['Z']);
+                    i++;
+                    break;
+                case CanvasPaintContext.PATH_DONE:
+                    return segs;
+                default:
+                    i++; // skip unknown command
+                    break;
+            }
+        }
+        return segs;
+    }
+
+    private buildPath2D(data: Int32Array, start = 0, end = 1): Path2D {
+        const segs = this.decodePath(data);
+        // Trim like Android's FloatsToPath.genPath: PathMeasure over the first contour,
+        // getSegment(start * len, stop * len); nothing at all when start >= stop.
+        if (start > 0 || end < 1) {
+            return start < end ? trimPathSegs(segs, Math.max(start, 0), Math.min(end, 1)) : new Path2D();
+        }
+        const path = new Path2D();
+        for (const s of segs) {
+            switch (s[0]) {
+                case 'M': path.moveTo(s[1], s[2]); break;
+                case 'L': path.lineTo(s[3], s[4]); break;
+                case 'Q': path.quadraticCurveTo(s[3], s[4], s[5], s[6]); break;
+                case 'C': path.bezierCurveTo(s[3], s[4], s[5], s[6], s[7], s[8]); break;
+                case 'Z': path.closePath(); break;
+            }
+        }
+        return path;
+    }
+
+    // --- Apply paint ---
+
+    private getEffectiveColor(): string | CanvasGradient | CanvasPattern {
+        if (this.colorFilterColor === null) {
+            return this.gradientStyle ?? this.color;
+        }
+        // Apply PorterDuff color filter: source=filter color, destination=paint color
+        // For opaque source (filter) and opaque destination (paint), per mode:
+        switch (this.colorFilterMode) {
+            case 0:  return 'rgba(0,0,0,0)'; // CLEAR: transparent
+            case 1:  return this.colorFilterColor; // SRC: filter color
+            case 2:  return this.gradientStyle ?? this.color; // DST: paint color
+            case 3:  return this.colorFilterColor; // SRC_OVER: opaque filter wins
+            case 4:  return this.gradientStyle ?? this.color; // DST_OVER: opaque paint wins
+            case 5:  return this.colorFilterColor; // SRC_IN: filter × paint_alpha = filter
+            case 6:  return this.gradientStyle ?? this.color; // DST_IN: paint × filter_alpha = paint
+            case 7:  return 'rgba(0,0,0,0)'; // SRC_OUT: filter × (1-paint_alpha) = 0
+            case 8:  return 'rgba(0,0,0,0)'; // DST_OUT: paint × (1-filter_alpha) = 0
+            case 9:  return this.colorFilterColor; // SRC_ATOP: filter
+            case 10: return this.gradientStyle ?? this.color; // DST_ATOP: paint
+            case 11: return 'rgba(0,0,0,0)'; // XOR: both opaque → transparent
+            default: {
+                // For advanced blend modes (12+), compute per-channel
+                return this.computeColorFilterBlend();
+            }
+        }
+    }
+
+    private computeColorFilterBlend(): string {
+        // Parse filter color components
+        const sA = ((this.colorFilterArgb >>> 24) & 0xFF) / 255;
+        const sR = (this.colorFilterArgb >>> 16) & 0xFF;
+        const sG = (this.colorFilterArgb >>> 8) & 0xFF;
+        const sB = this.colorFilterArgb & 0xFF;
+        // Parse paint color - extract from rgba string
+        const m = this.color.match(/rgba?\((\d+),(\d+),(\d+),?([^)]*)\)/);
+        const dR = m ? parseInt(m[1]) : 0;
+        const dG = m ? parseInt(m[2]) : 0;
+        const dB = m ? parseInt(m[3]) : 0;
+        const dA = m && m[4] ? parseFloat(m[4]) : 1;
+        let rR: number, rG: number, rB: number, rA: number;
+        const blend1 = (a: number, b: number) => {
+            switch (this.colorFilterMode) {
+                case 12: return Math.min(255, a + b); // PLUS
+                case 13: return (a * b) / 255; // MODULATE
+                case 14: return a + b - (a * b) / 255; // SCREEN
+                case 15: // OVERLAY: 2*Cb*Cs/255 if Cb≤127, else 255-2*(255-Cb)*(255-Cs)/255
+                    return b <= 127 ? (2 * a * b) / 255 : 255 - (2 * (255 - a) * (255 - b)) / 255;
+                case 16: return Math.min(a, b); // DARKEN
+                case 17: return Math.max(a, b); // LIGHTEN
+                case 18: return b === 0 ? 0 : Math.min(255, (a * 255) / (255 - b)); // COLOR_DODGE
+                case 19: return b === 255 ? 255 : Math.max(0, 255 - ((255 - a) * 255) / b); // COLOR_BURN
+                case 20: // HARD_LIGHT: overlay with swapped args
+                    return a <= 127 ? (2 * a * b) / 255 : 255 - (2 * (255 - a) * (255 - b)) / 255;
+                case 21: { // SOFT_LIGHT
+                    const t = (a / 255);
+                    return b <= 127 ? b - (1 - 2 * t) * b * (1 - b / 255) * 255
+                        : b + (2 * t - 1) * (Math.sqrt(b / 255) * 255 - b);
+                }
+                case 22: return Math.abs(a - b); // DIFFERENCE
+                case 23: return a + b - (2 * a * b) / 255; // EXCLUSION
+                case 24: return (a * b) / 255; // MULTIPLY
+                default: return a; // Fallback: use filter channel
+            }
+        };
+        rR = blend1(sR, dR);
+        rG = blend1(sG, dG);
+        rB = blend1(sB, dB);
+        rA = Math.min(1, sA + dA - sA * dA);
+        return `rgba(${Math.round(rR)},${Math.round(rG)},${Math.round(rB)},${rA.toFixed(3)})`;
+    }
+
+    private createSweepGradientPattern(
+        cx: number, cy: number, colors: number[], stops: number[]
+    ): CanvasPattern | null {
+        // Determine canvas dimensions needed to cover the sweep from center
+        const ctx = this.mContext;
+        const w = ctx ? ctx.mWidth || 256 : 256;
+        const h = ctx ? ctx.mHeight || 256 : 256;
+        try {
+            const layerCtx = this.createLayerCanvas(w, h);
+            const imgData = layerCtx.createImageData(w, h);
+            const data = imgData.data;
+            // Parse ARGB colors into RGBA arrays
+            const colorComponents: Array<[number, number, number, number]> = colors.map(argb => [
+                (argb >>> 16) & 0xFF, // R
+                (argb >>> 8) & 0xFF,  // G
+                argb & 0xFF,          // B
+                ((argb >>> 24) & 0xFF) / 255 // A
+            ]);
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    let angle = Math.atan2(y - cy, x - cx); // -PI..PI
+                    if (angle < 0) angle += Math.PI * 2;
+                    const t = angle / (Math.PI * 2); // 0..1
+                    // Find the two stops this t falls between
+                    let idx = 0;
+                    for (let s = 0; s < stops.length - 1; s++) {
+                        if (t >= stops[s]) idx = s;
+                    }
+                    const t0 = stops[idx];
+                    const t1 = stops[Math.min(idx + 1, stops.length - 1)];
+                    const range = t1 - t0;
+                    const frac = range > 0 ? (t - t0) / range : 0;
+                    const c0 = colorComponents[idx];
+                    const c1 = colorComponents[Math.min(idx + 1, colorComponents.length - 1)];
+                    const off = (y * w + x) * 4;
+                    data[off] = c0[0] + (c1[0] - c0[0]) * frac;
+                    data[off + 1] = c0[1] + (c1[1] - c0[1]) * frac;
+                    data[off + 2] = c0[2] + (c1[2] - c0[2]) * frac;
+                    data[off + 3] = (c0[3] + (c1[3] - c0[3]) * frac) * 255;
+                }
+            }
+            layerCtx.putImageData(imgData, 0, 0);
+            return this.ctx.createPattern(layerCtx.canvas as any, 'no-repeat');
+        } catch (_e) {
+            return null;
+        }
+    }
+
+    /**
+     * A fill style that still lands correctly when the canvas has been translated to
+     * (x, y) and rotated by `angle`.
+     *
+     * Text on a path is drawn one glyph at a time inside exactly that transform, and a
+     * CanvasGradient resolves against the user space in force when it is USED — so a
+     * gradient authored in document coordinates is sampled, for every glyph, from a space
+     * that has been moved and spun. The glyphs come out filled from whatever part of the
+     * gradient happens to land under them, which for a mostly-transparent gradient means
+     * they do not appear at all. The C++ player has no such problem because Skia applies
+     * the shader's own local matrix.
+     *
+     * The cure is to re-express the gradient in glyph-local space: compose the inverse of
+     * translate(x, y) * rotate(angle) and map the gradient's geometry through it. A
+     * pattern (what the sweep polyfill produces where createConicGradient is missing)
+     * carries its own matrix and only needs that inverse handed to it.
+     */
+    private fillStyleUnderGlyph(x: number, y: number, angle: number):
+            CanvasGradient | CanvasPattern | null {
+        const style = this.gradientStyle;
+        if (!style) return null;
+        const cos = Math.cos(angle), sin = Math.sin(angle);
+        // Inverse of translate(x, y) * rotate(angle).
+        const a = cos, b = -sin, c = sin, d = cos;
+        const e = -(x * cos + y * sin), f = x * sin - y * cos;
+
+        if (typeof (style as CanvasPattern).setTransform === 'function') {
+            const m = this.ctx.getTransform();
+            m.a = a; m.b = b; m.c = c; m.d = d; m.e = e; m.f = f;
+            (style as CanvasPattern).setTransform(m);
+            return style;
+        }
+
+        const spec = this.gradientSpec;
+        if (!spec) return style;            // nothing to rebuild from; no worse than before
+        const local = (px: number, py: number): [number, number] =>
+            [a * px + c * py + e, b * px + d * py + f];
+        let g: CanvasGradient | null = null;
+        if (spec.kind === 'sweep') {
+            if (typeof (this.ctx as any).createConicGradient !== 'function') return style;
+            const [qx, qy] = local(spec.cx, spec.cy);
+            // The sweep's own start angle has to turn back by the same rotation.
+            g = (this.ctx as any).createConicGradient(-angle, qx, qy);
+        } else if (spec.kind === 'radial') {
+            const [qx, qy] = local(spec.cx, spec.cy);
+            g = this.ctx.createRadialGradient(qx, qy, 0, qx, qy, spec.radius);
+        } else {
+            const [ax, ay] = local(spec.x1, spec.y1);
+            const [bx, by] = local(spec.x2, spec.y2);
+            g = this.ctx.createLinearGradient(ax, ay, bx, by);
+        }
+        if (!g) return style;
+        for (let s = 0; s < spec.stops.length && s < spec.colors.length; s++) {
+            g.addColorStop(Math.max(0, Math.min(1, spec.stops[s])), argbToRgba(spec.colors[s]));
+        }
+        return g;
+    }
+
+    private applyFillStyle(override?: CanvasGradient | CanvasPattern | null): void {
+        this.ctx.fillStyle = override ?? this.getEffectiveColor();
+        this.ctx.globalAlpha = this.alpha * this.mLayerAlpha;
+        this.ctx.globalCompositeOperation = this.blendMode;
+    }
+
+    private applyStrokeStyle(override?: CanvasGradient | CanvasPattern | null): void {
+        this.ctx.strokeStyle = override ?? this.getEffectiveColor();
+        this.ctx.lineWidth = this.strokeWidth;
+        this.ctx.lineCap = this.lineCap;
+        this.ctx.lineJoin = this.lineJoin;
+        this.ctx.miterLimit = this.miterLimit;
+        this.ctx.globalAlpha = this.alpha * this.mLayerAlpha;
+        this.ctx.globalCompositeOperation = this.blendMode;
+    }
+
+    private fillOrStroke(doFill: () => void, doStroke: () => void): void {
+        if (this.style === 0 || this.style === 2) {
+            this.applyFillStyle();
+            doFill();
+        }
+        if (this.style === 1 || this.style === 2) {
+            this.applyStrokeStyle();
+            doStroke();
+        }
+    }
+
+    private setFont(): void {
+        // CSS canvas font shorthand: [style] [weight] size family.
+        // Anything skipped here is silently ignored at render time, so
+        // weight + italic must always be folded in for them to take effect.
+        const style = this.fontItalic ? 'italic ' : '';
+        const weight = this.fontWeight !== 400 ? `${this.fontWeight} ` : '';
+        this.ctx.font = `${style}${weight}${this.textSize}px ${this.fontFamily}`;
+    }
+
+    // --- PaintContext abstract methods ---
+
+    applyPaint(paintData: PaintBundle): void {
+        const arr = paintData.getArray();
+        const len = paintData.getLength();
+        // A paint bundle is a *delta*: it carries only the properties it changes, and
+        // everything else stays as the previous bundle left it. So nothing is cleared on
+        // entry — not the shader, not anything else. `replacePaint` is the variant that
+        // resets first, and the host resets once per paint cycle (RcdPlayer.renderFrame),
+        // which is what stops state leaking from one frame into the next.
+        //
+        // This previously cleared `gradientStyle` here, which quietly broke that contract:
+        // a bundle setting only an alpha would drop a shader an earlier bundle had set.
+        // A float that is still a variable reference — a bundle painted before its
+        // variables were resolved — is looked up here rather than applied as NaN, which the
+        // canvas would silently ignore. The C++ paint context does the same.
+        const context = this.getContext();
+        const floatArg = (bits: number): number => {
+            if (isNaNBits(bits) && context) return context.getFloat(idFromBits(bits));
+            return intBitsToFloat(bits);
+        };
+        let i = 0;
+        while (i < len) {
+            const cmd = arr[i++];
+            const tag = cmd & 0xFFFF;
+            const upper = (cmd >> 16) & 0xFFFF;
+            switch (tag) {
+                case PaintBundle.TEXT_SIZE:
+                    this.textSize = floatArg(arr[i++]);
+                    this.setFont();
+                    break;
+                case PaintBundle.COLOR: {
+                    // Does NOT clear the gradient: colour and shader are independent
+                    // properties of a Paint, and the shader wins when filling. This
+                    // document sets COLOR *after* its GRADIENT, and clearing here painted
+                    // the chart in the default opaque black.
+                    const argb = arr[i++] | 0;
+                    this.colorArgb = argb;
+                    // A paint bundle is a *delta*, so state carries from one bundle to the
+                    // next — but Paint.setColor takes a whole ARGB, alpha included, and so
+                    // replaces whatever alpha a previous setAlpha established. Without this
+                    // line one translucent fill tinted everything drawn after it, and the
+                    // player disagreed with both the Android reference and the C++ port.
+                    this.alpha = ((argb >>> 24) & 0xFF) / 255;
+                    // The alpha now lives in `alpha`, which is applied as globalAlpha.
+                    // Leaving it in the colour string as well would apply it twice.
+                    this.color = `rgb(${(argb >>> 16) & 0xFF},${(argb >>> 8) & 0xFF},`
+                               + `${argb & 0xFF})`;
+                    break;
+                }
+                case PaintBundle.STROKE_WIDTH:
+                    this.strokeWidth = floatArg(arr[i++]);
+                    break;
+                case PaintBundle.STROKE_MITER:
+                    this.miterLimit = floatArg(arr[i++]);
+                    break;
+                case PaintBundle.STROKE_CAP:
+                    this.lineCap = upper === 0 ? 'butt' : upper === 1 ? 'round' : 'square';
+                    break;
+                case PaintBundle.STYLE:
+                    this.style = upper;
+                    break;
+                case PaintBundle.SHADER: {
+                    // id 0 means SkPaint::setShader(nullptr), and in Skia a gradient IS a
+                    // shader - one slot, so clearing it has to clear a gradient too. This
+                    // player keeps gradients and runtime shaders in separate fields, so
+                    // clearing only `activeShaderData` left a gradient filling every later
+                    // draw with no way to turn it off: {"shader": 0} is the documented way to
+                    // clear, it works in the C++ port, and it silently did nothing here. An
+                    // author hit this and gave up on gradients rather than find it.
+                    //
+                    // Only the clear is mirrored. Making a *set* move both fields would be the
+                    // same one-slot argument, but no document reported a problem with it and
+                    // it measurably moved rc-json-particle-sphere further from the C++ render,
+                    // so it is left alone until something actually needs it.
+                    const shaderId = arr[i++];
+                    if (shaderId === 0) {
+                        this.activeShaderData = null;
+                        this.gradientStyle = null;
+                        this.gradientSpec = null;
+                    } else {
+                        const sd = this.getContext()?.getShader(shaderId);
+                        this.activeShaderData = sd ?? null;
+                    }
+                    break;
+                }
+                case PaintBundle.IMAGE_FILTER_QUALITY:
+                    // value in upper bits, no data int
+                    break;
+                case PaintBundle.GRADIENT: {
+                    const meta = arr[i++];
+                    const numColors = meta & 0xFF;
+                    const colors: number[] = [];
+                    for (let c = 0; c < numColors; c++) {
+                        colors.push(arr[i++]);
+                    }
+                    const numStops = arr[i++];
+                    const stops: number[] = [];
+                    if (numStops > 0) {
+                        for (let s = 0; s < numStops; s++) {
+                            stops.push(intBitsToFloat(arr[i++]));
+                        }
+                    } else {
+                        // Auto-generate evenly spaced stops
+                        for (let s = 0; s < numColors; s++) {
+                            stops.push(numColors > 1 ? s / (numColors - 1) : 0);
+                        }
+                    }
+                    let gradient: CanvasGradient | null = null;
+                    if (upper === PaintBundle.SWEEP_GRADIENT) {
+                        const cx = intBitsToFloat(arr[i++]);
+                        const cy = intBitsToFloat(arr[i++]);
+                        // Sweep gradient has NO tileMode
+                        this.gradientSpec = { kind: 'sweep', colors, stops, cx, cy,
+                                              radius: 0, x1: 0, y1: 0, x2: 0, y2: 0 };
+                        if (typeof (this.ctx as any).createConicGradient === 'function') {
+                            gradient = (this.ctx as any).createConicGradient(0, cx, cy);
+                        } else {
+                            // Polyfill: render sweep gradient to a pattern
+                            const sweepPattern = this.createSweepGradientPattern(cx, cy, colors, stops);
+                            if (sweepPattern) {
+                                this.gradientStyle = sweepPattern;
+                            }
+                        }
+                    } else if (upper === PaintBundle.RADIAL_GRADIENT) {
+                        const cx = intBitsToFloat(arr[i++]);
+                        const cy = intBitsToFloat(arr[i++]);
+                        const radius = intBitsToFloat(arr[i++]);
+                        i++; // tileMode
+                        this.gradientSpec = { kind: 'radial', colors, stops, cx, cy,
+                                              radius, x1: 0, y1: 0, x2: 0, y2: 0 };
+                        gradient = this.ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+                    } else {
+                        // LINEAR_GRADIENT (upper=0)
+                        const startX = intBitsToFloat(arr[i++]);
+                        const startY = intBitsToFloat(arr[i++]);
+                        const endX = intBitsToFloat(arr[i++]);
+                        const endY = intBitsToFloat(arr[i++]);
+                        i++; // tileMode
+                        this.gradientSpec = { kind: 'linear', colors, stops, cx: 0, cy: 0,
+                                              radius: 0, x1: startX, y1: startY,
+                                              x2: endX, y2: endY };
+                        gradient = this.ctx.createLinearGradient(startX, startY, endX, endY);
+                    }
+                    if (gradient) {
+                        for (let s = 0; s < stops.length && s < colors.length; s++) {
+                            gradient.addColorStop(
+                                Math.max(0, Math.min(1, stops[s])),
+                                argbToRgba(colors[s])
+                            );
+                        }
+                        this.gradientStyle = gradient;
+                    }
+                    break;
+                }
+                case PaintBundle.ALPHA:
+                    this.alpha = floatArg(arr[i++]);
+                    break;
+                case PaintBundle.COLOR_FILTER: {
+                    const cfArgb = arr[i++];
+                    this.colorFilterArgb = cfArgb;
+                    this.colorFilterColor = argbToRgba(cfArgb);
+                    this.colorFilterMode = upper;
+                    break;
+                }
+                case PaintBundle.ANTI_ALIAS:
+                    this.antiAlias = upper !== 0;
+                    break;
+                case PaintBundle.STROKE_JOIN:
+                    this.lineJoin = upper === 0 ? 'miter' : upper === 1 ? 'round' : 'bevel';
+                    break;
+                case PaintBundle.TYPEFACE: {
+                    // upper packs (weight & 0x3FF) | (italic ? 2048 : 0)
+                    // — see PaintBundle.java:881 / setTextStyle. Decode
+                    // both flags so they actually affect the rendered font.
+                    const weight = upper & 0x3FF;
+                    const italic = (upper & 2048) !== 0;
+                    this.fontWeight = weight > 0 ? weight : 400;
+                    this.fontItalic = italic;
+
+                    const fontType = arr[i++];
+                    // Map Android typeface IDs to CSS font families
+                    // 0=DEFAULT, 1=SANS_SERIF, 2=SERIF, 3=MONOSPACE
+                    switch (fontType) {
+                        case 1: this.fontFamily = 'sans-serif'; break;
+                        case 2: this.fontFamily = 'serif'; break;
+                        case 3: this.fontFamily = 'monospace'; break;
+                        default: this.fontFamily = 'sans-serif'; break;
+                    }
+                    this.setFont();
+                    break;
+                }
+                case PaintBundle.FILTER_BITMAP:
+                    this.filterBitmap = upper !== 0;
+                    this.ctx.imageSmoothingEnabled = this.filterBitmap;
+                    break;
+                case PaintBundle.BLEND_MODE:
+                    this.blendMode = this.mapBlendMode(upper);
+                    break;
+                case PaintBundle.COLOR_ID: {
+                    // Value is already resolved to ARGB by PaintBundle.updateVariables().
+                    // As with COLOR, this leaves any shader alone. Java applies COLOR_ID and
+                    // COLOR alike (Paint.setColor), so it replaces the alpha too: keeping a
+                    // previous ALPHA here drew the next canvas with the last canvas's alpha
+                    // (0 after an off Switch) where Java and C++ draw it opaque (T27).
+                    const argb = arr[i++] | 0;
+                    this.colorArgb = argb;
+                    this.alpha = ((argb >>> 24) & 0xFF) / 255;
+                    this.color = `rgb(${(argb >>> 16) & 0xFF},${(argb >>> 8) & 0xFF},`
+                               + `${argb & 0xFF})`;
+                    break;
+                }
+                case PaintBundle.COLOR_FILTER_ID: {
+                    // Value is already resolved to ARGB by PaintBundle.updateVariables()
+                    const cfColor = arr[i++];
+                    this.colorFilterColor = argbToRgba(cfColor);
+                    this.colorFilterArgb = cfColor;
+                    break;
+                }
+                case PaintBundle.CLEAR_COLOR_FILTER:
+                    this.colorFilterColor = null;
+                    break;
+                case PaintBundle.SHADER_MATRIX:
+                    i++; // skip float-as-int
+                    break;
+                case PaintBundle.FONT_AXIS: {
+                    const axisCount = upper;
+                    i += axisCount * 2; // each axis: tag int + value float-as-int
+                    break;
+                }
+                case PaintBundle.TEXTURE: {
+                    const bitmapId = arr[i++];
+                    const tileModes = arr[i++];
+                    i++; // filter (Canvas2D uses its own sampling)
+
+                    const tileX = tileModes & 0xF;
+                    const tileY = (tileModes >> 16) & 0xF;
+
+                    const img = this.bitmapCache.get(bitmapId);
+                    if (img) {
+                        // Map tile modes to Canvas2D pattern repetition
+                        // 0=CLAMP(no-repeat), 1=REPEAT, 2=MIRROR(repeat), 3=DECAL(no-repeat)
+                        const xRepeat = (tileX === 1 || tileX === 2);
+                        const yRepeat = (tileY === 1 || tileY === 2);
+                        let repetition: string;
+                        if (xRepeat && yRepeat) repetition = 'repeat';
+                        else if (xRepeat) repetition = 'repeat-x';
+                        else if (yRepeat) repetition = 'repeat-y';
+                        else repetition = 'no-repeat';
+
+                        const pattern = this.ctx.createPattern(img as CanvasImageSource, repetition);
+                        if (pattern) {
+                            this.gradientStyle = pattern;
+                        }
+                    }
+                    break;
+                }
+                case PaintBundle.PATH_EFFECT: {
+                    // Payload (PaintPathEffects.dash): [type, phase, len, intervals…], `count`
+                    // ints in all; type and len are raw ints, phase and the intervals floats.
+                    // An empty payload clears the effect, as the C++ player's does.
+                    const count = upper;
+                    if (count === 0) {
+                        this.ctx.setLineDash([]);
+                        this.ctx.lineDashOffset = 0;
+                    } else if (count >= 3) {
+                        const type = arr[i];
+                        const phase = floatArg(arr[i + 1]);
+                        const len = arr[i + 2];
+                        i += 3;
+                        const intervals: number[] = [];
+                        for (let k = 0; k < len && k < count - 3; k++) intervals.push(floatArg(arr[i++]));
+                        for (let k = 3 + len; k < count; k++) i++;
+                        if (type === 1 && intervals.length >= 2 && intervals.length % 2 === 0) {
+                            this.ctx.setLineDash(intervals);
+                            this.ctx.lineDashOffset = phase;
+                        } else {
+                            this.ctx.setLineDash([]);
+                            this.ctx.lineDashOffset = 0;
+                        }
+                    } else {
+                        i += count;
+                    }
+                    break;
+                }
+                case PaintBundle.FALLBACK_TYPEFACE:
+                    i++; // skip font type int
+                    break;
+                default:
+                    if (tag === 0) break; // sentinel / padding - skip silently
+                    // Unknown tag - can't safely skip, stop parsing
+                    console.warn(`PaintBundle: unknown tag ${tag} at index ${i - 1}`);
+                    return;
+            }
+        }
+    }
+
+    replacePaint(paintBundle: PaintBundle): void {
+        this.resetPaintState();
+        this.applyPaint(paintBundle);
+    }
+
+    private resetPaintState(): void {
+        this.color = 'rgba(0,0,0,1)';
+        this.style = 0;
+        this.strokeWidth = 1;
+        this.textSize = 14;
+        this.alpha = 1;
+        this.lineCap = 'butt';
+        this.lineJoin = 'miter';
+        this.miterLimit = 10;
+        this.blendMode = 'source-over';
+        this.antiAlias = true;
+        this.filterBitmap = true;
+        this.letterSpacing = 0;
+        this.gradientStyle = null;
+        this.fontFamily = 'sans-serif';
+        this.fontWeight = 400;
+        this.fontItalic = false;
+        this.colorFilterColor = null;
+        this.colorFilterArgb = 0;
+        this.colorFilterMode = 3;
+        this.activeShaderData = null;
+        this.ctx.setLineDash([]);
+        this.ctx.lineDashOffset = 0;
+        this.setFont();
+    }
+
+    private mapBlendMode(mode: number): GlobalCompositeOperation {
+        switch (mode) {
+            case 0: return 'clear' as GlobalCompositeOperation;  // CLEAR
+            case 1: return 'copy';               // SRC
+            case 2: return 'destination' as GlobalCompositeOperation; // DST (keep destination only)
+            case 3: return 'source-over';        // SRC_OVER (default)
+            case 4: return 'destination-over';   // DST_OVER
+            case 5: return 'source-in';          // SRC_IN
+            case 6: return 'destination-in';     // DST_IN
+            case 7: return 'source-out';         // SRC_OUT
+            case 8: return 'destination-out';    // DST_OUT
+            case 9: return 'source-atop';        // SRC_ATOP
+            case 10: return 'destination-atop';  // DST_ATOP
+            case 11: return 'xor';               // XOR
+            case 12: return 'lighter';           // PLUS/ADD
+            case 13: return 'multiply';          // MODULATE (closest to multiply)
+            case 14: return 'screen';            // SCREEN
+            case 15: return 'overlay';           // OVERLAY
+            case 16: return 'darken';            // DARKEN
+            case 17: return 'lighten';           // LIGHTEN
+            case 18: return 'color-dodge';       // COLOR_DODGE
+            case 19: return 'color-burn';        // COLOR_BURN
+            case 20: return 'hard-light';        // HARD_LIGHT
+            case 21: return 'soft-light';        // SOFT_LIGHT
+            case 22: return 'difference';        // DIFFERENCE
+            case 23: return 'exclusion';         // EXCLUSION
+            case 24: return 'multiply';          // MULTIPLY
+            case 25: return 'hue';               // HUE
+            case 26: return 'saturation';        // SATURATION
+            case 27: return 'color';             // COLOR
+            case 28: return 'luminosity';        // LUMINOSITY
+            case 30: return 'lighter';           // PORTER_MODE_ADD
+            default: return 'source-over';
+        }
+    }
+
+    savePaint(): void {
+        this.paintStack.push({
+            color: this.color, style: this.style, strokeWidth: this.strokeWidth,
+            textSize: this.textSize, alpha: this.alpha, lineCap: this.lineCap,
+            lineJoin: this.lineJoin, miterLimit: this.miterLimit,
+            blendMode: this.blendMode, antiAlias: this.antiAlias,
+            letterSpacing: this.letterSpacing, gradientStyle: this.gradientStyle,
+            activeShaderData: this.activeShaderData,
+            fontFamily: this.fontFamily, fontWeight: this.fontWeight,
+            fontItalic: this.fontItalic, filterBitmap: this.filterBitmap,
+            colorFilterColor: this.colorFilterColor,
+            colorFilterArgb: this.colorFilterArgb, colorFilterMode: this.colorFilterMode
+        });
+    }
+
+    restorePaint(): void {
+        const state = this.paintStack.pop();
+        if (state) {
+            Object.assign(this, state);
+            this.setFont();
+            this.ctx.globalAlpha = this.alpha * this.mLayerAlpha;
+        }
+    }
+
+    /**
+     * If an active shader is set, render it via WebGL2 into the given
+     * rectangle and return true. Otherwise return false (caller does
+     * the normal fill).
+     */
+    private tryRenderShader(left: number, top: number, right: number, bottom: number): boolean {
+        const ctx = this.getContext();
+        if (!this.activeShaderData || !ctx) return false;
+        const sd = this.activeShaderData;
+
+        // Get shader source text
+        const textId = sd.getShaderTextId();
+        const shaderText = this.textCache.get(textId);
+        if (!shaderText) return false;
+
+        // Transpile (cached by string textId)
+        const cacheKey = String(textId);
+        let glsl = this.glslCache.get(textId);
+        if (!glsl) {
+            try {
+                const result = transpileAgslToGlsl(shaderText);
+                glsl = result.glsl;
+                this.glslCache.set(textId, glsl);
+            } catch (e) {
+                console.error(`[shader] transpile failed (textId=${textId}):`, e, '\nAGSL:', shaderText);
+                return false;
+            }
+        }
+
+        // One renderer per document. Sharing a single renderer page-wide looks
+        // tempting (a browser allows only ~16 live WebGL contexts) but is wrong: the
+        // renderer draws into its own offscreen canvas, so documents sharing one read
+        // back whichever shader drew last. Every card on a page then shows the same
+        // shader. Contexts are bounded by paginating the page, not by sharing.
+        if (!this.shaderRenderer) {
+            this.shaderRenderer = new WebGLShaderRenderer();
+            if (!this.shaderRenderer.isAvailable()) {
+                this.shaderRenderer = null;
+                return false;
+            }
+        }
+
+        let w = Math.round(right - left);
+        let h = Math.round(top > bottom ? top - bottom : bottom - top);
+        if (w <= 0 || h <= 0) return false;
+
+        // Cap to actual canvas size — avoid creating absurdly large WebGL
+        // surfaces for documents taller/wider than the viewport.
+        const maxW = this.ctx.canvas.width || 4096;
+        const maxH = this.ctx.canvas.height || 4096;
+        if (w > maxW) w = maxW;
+        if (h > maxH) h = maxH;
+
+        // Resolve NaN-encoded uniform IDs to current values
+        sd.updateVariables(ctx);
+
+        // Collect float uniforms
+        const floats = new Map<string, Float32Array>();
+        for (const name of sd.getUniformFloatNames()) {
+            const vals = sd.getUniformFloats(name);
+            floats.set(name, vals);
+        }
+
+        // Collect int uniforms
+        const ints = new Map<string, Int32Array>();
+        for (const name of sd.getUniformIntegerNames()) {
+            ints.set(name, sd.getUniformInts(name));
+        }
+
+        // Collect texture uniforms
+        let textures: Map<string, TexImageSource> | undefined;
+        const bitmapNames = sd.getUniformBitmapNames();
+        if (bitmapNames.length > 0) {
+            textures = new Map();
+            for (const name of bitmapNames) {
+                const bmpId = sd.getUniformBitmapId(name);
+                if (bmpId < 0) continue;
+                const offCtx = this.bitmapCanvasCache.get(bmpId);
+                if (offCtx) {
+                    textures.set(name, offCtx.canvas as any);
+                } else {
+                    const img = this.bitmapCache.get(bmpId);
+                    if (img) textures.set(name, img);
+                }
+            }
+        }
+
+        // Render via WebGL — pass document rect size for coordinate scaling
+        const docW = Math.round(right - left);
+        const docH = Math.round(Math.abs(bottom - top));
+        const ok = this.shaderRenderer.render(
+            glsl, w, h, floats, ints, textures, cacheKey, docW, docH);
+        if (!ok) {
+            console.error(`[shader] WebGL render FAILED textId=${textId}`);
+            return false;
+        }
+
+        // Composite into Canvas2D at the original document rect (the canvas
+        // transform handles scaling from document coords to screen pixels).
+        this.ctx.globalAlpha = this.alpha * this.mLayerAlpha;
+        this.ctx.globalCompositeOperation = this.blendMode;
+        const dstW = right - left;
+        const dstH = Math.abs(bottom - top);
+        this.ctx.drawImage(this.shaderRenderer.getCanvas(),
+                           left, Math.min(top, bottom), dstW, dstH);
+        return true;
+    }
+
+    // --- Drawing ---
+
+    drawRect(left: number, top: number, right: number, bottom: number): void {
+        // If an AGSL shader is active, render it via WebGL2 instead of the
+        // normal Canvas2D fill.  Falls back to regular fill on failure.
+        if (this.activeShaderData && this.tryRenderShader(left, top, right, bottom)) {
+            return;
+        }
+        this.fillOrStroke(
+            () => { this.ctx.fillRect(left, top, right - left, bottom - top); },
+            () => { this.ctx.strokeRect(left, top, right - left, bottom - top); }
+        );
+    }
+
+    drawCircle(centerX: number, centerY: number, radius: number): void {
+        if (radius <= 0) return;
+        this.ctx.beginPath();
+        this.ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+        this.fillOrStroke(
+            () => { this.ctx.fill(); },
+            () => { this.ctx.stroke(); }
+        );
+    }
+
+    drawLine(x1: number, y1: number, x2: number, y2: number): void {
+        this.applyStrokeStyle();
+        this.ctx.beginPath();
+        this.ctx.moveTo(x1, y1);
+        this.ctx.lineTo(x2, y2);
+        this.ctx.stroke();
+    }
+
+    drawOval(left: number, top: number, right: number, bottom: number): void {
+        const cx = (left + right) / 2;
+        const cy = (top + bottom) / 2;
+        // Math.abs: an inverted rect (right < left) yields a negative radius, and Canvas2D's
+        // ellipse() throws IndexSizeError on that where Skia simply normalises the rect. One
+        // such rect kills the whole document — the exception escapes the paint and nothing
+        // after it draws. Normalising here matches every other player.
+        const rx = Math.abs(right - left) / 2;
+        const ry = Math.abs(bottom - top) / 2;
+        this.ctx.beginPath();
+        this.ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+        this.fillOrStroke(
+            () => { this.ctx.fill(); },
+            () => { this.ctx.stroke(); }
+        );
+    }
+
+    drawRoundRect(left: number, top: number, right: number, bottom: number, rx: number, ry: number): void {
+        const w = right - left;
+        const h = bottom - top;
+        this.ctx.beginPath();
+        // A negative radius (an expression that went below 0) is a square corner, as in Skia;
+        // the canvas API throws RangeError for it, which stopped the whole paint.
+        this.ctx.roundRect(left, top, w, h, [Math.max(0, Math.min(rx, ry))]);
+        this.fillOrStroke(
+            () => { this.ctx.fill(); },
+            () => { this.ctx.stroke(); }
+        );
+    }
+
+    drawArc(left: number, top: number, right: number, bottom: number, startAngle: number, sweepAngle: number): void {
+        const cx = (left + right) / 2;
+        const cy = (top + bottom) / 2;
+        // Math.abs: an inverted rect (right < left) yields a negative radius, and Canvas2D's
+        // ellipse() throws IndexSizeError on that where Skia simply normalises the rect. One
+        // such rect kills the whole document — the exception escapes the paint and nothing
+        // after it draws. Normalising here matches every other player.
+        const rx = Math.abs(right - left) / 2;
+        const ry = Math.abs(bottom - top) / 2;
+        const start = (startAngle * Math.PI) / 180;
+        const end = ((startAngle + sweepAngle) * Math.PI) / 180;
+        this.ctx.beginPath();
+        this.ctx.ellipse(cx, cy, rx, ry, 0, start, end, sweepAngle < 0);
+        this.fillOrStroke(
+            () => { this.ctx.fill(); },
+            () => { this.ctx.stroke(); }
+        );
+    }
+
+    drawSector(left: number, top: number, right: number, bottom: number, startAngle: number, sweepAngle: number): void {
+        const cx = (left + right) / 2;
+        const cy = (top + bottom) / 2;
+        // Math.abs: an inverted rect (right < left) yields a negative radius, and Canvas2D's
+        // ellipse() throws IndexSizeError on that where Skia simply normalises the rect. One
+        // such rect kills the whole document — the exception escapes the paint and nothing
+        // after it draws. Normalising here matches every other player.
+        const rx = Math.abs(right - left) / 2;
+        const ry = Math.abs(bottom - top) / 2;
+        const start = (startAngle * Math.PI) / 180;
+        const end = ((startAngle + sweepAngle) * Math.PI) / 180;
+        this.ctx.beginPath();
+        this.ctx.moveTo(cx, cy);
+        this.ctx.ellipse(cx, cy, rx, ry, 0, start, end, sweepAngle < 0);
+        this.ctx.closePath();
+        this.fillOrStroke(
+            () => { this.ctx.fill(); },
+            () => { this.ctx.stroke(); }
+        );
+    }
+
+    // ── 2D vertex meshes ────────────────────────────────────────────────────────────────
+    //
+    // Canvas2D has no drawVertices and no Gouraud shading, so the triangle list is walked
+    // here. Two consequences worth stating rather than discovering:
+    //
+    //   * Per-vertex colour is approximated by filling each triangle with the AVERAGE of its
+    //     three vertex colours. Skia and Android interpolate across the face, so a mesh used
+    //     as a smooth gradient shows faceting here, more visibly as uCount/vCount drop.
+    //   * A textured triangle is drawn by clipping to it and applying the affine that takes
+    //     its uv triangle to its screen triangle — three corresponding points determine that
+    //     exactly, which makes it a real texture map rather than a stretched blit.
+
+    setMesh(meshId: number, layout: number, uCount: number, vCount: number,
+            verts: Float32Array, uv: Float32Array,
+            colors: Int32Array, indices: Int32Array): void {
+        this.meshCache.set(meshId, { layout, uCount, vCount, verts, uv, colors, indices });
+    }
+
+    drawMesh(meshId: number, blend: number, imageId: number): void {
+        const m = this.meshCache.get(meshId);
+        if (!m) return;
+        const vertexCount = m.verts.length / 2;
+        if (vertexCount < 3 || m.indices.length < 3) return;
+
+        let texture: HTMLImageElement | ImageBitmap | undefined;
+        if (blend === MESH_BLEND_MODULATE && imageId !== 0
+            && m.uv.length === m.verts.length) {
+            texture = this.bitmapCache.get(imageId);
+        }
+
+        // save/restore brackets the whole walk: this must leave the context exactly as it
+        // found it, and the per-triangle fills below overwrite fillStyle.
+        this.ctx.save();
+        const texW = texture ? (texture as any).width : 0;
+        const texH = texture ? (texture as any).height : 0;
+
+        // Flat, untextured mesh: one path for the whole thing, filled once.
+        //
+        // Filling triangle by triangle is correct but ugly here — Canvas2D antialiases every
+        // edge, and two adjacent half-covered edges composite to a visible seam, so the mesh
+        // comes out drawn in a net of hairlines. Merging them into a single path removes the
+        // internal edges altogether rather than trying to hide them, and it is also markedly
+        // faster on a dense grid. Only possible when every triangle takes the same paint;
+        // per-vertex colour and texture still need a fill each.
+        if (!texture && m.colors.length !== vertexCount) {
+            const all = new Path2D();
+            for (let t = 0; t + 2 < m.indices.length; t += 3) {
+                const i0 = m.indices[t], i1 = m.indices[t + 1], i2 = m.indices[t + 2];
+                if (i0 < 0 || i1 < 0 || i2 < 0) continue;
+                if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) continue;
+                all.moveTo(m.verts[i0 * 2], m.verts[i0 * 2 + 1]);
+                all.lineTo(m.verts[i1 * 2], m.verts[i1 * 2 + 1]);
+                all.lineTo(m.verts[i2 * 2], m.verts[i2 * 2 + 1]);
+                all.closePath();
+            }
+            this.applyFillStyle();
+            this.ctx.fill(all);
+            this.ctx.restore();
+            return;
+        }
+
+        for (let t = 0; t + 2 < m.indices.length; t += 3) {
+            const i0 = m.indices[t], i1 = m.indices[t + 1], i2 = m.indices[t + 2];
+            if (i0 < 0 || i1 < 0 || i2 < 0) continue;
+            if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) continue;
+            const x0 = m.verts[i0 * 2], y0 = m.verts[i0 * 2 + 1];
+            const x1 = m.verts[i1 * 2], y1 = m.verts[i1 * 2 + 1];
+            const x2 = m.verts[i2 * 2], y2 = m.verts[i2 * 2 + 1];
+
+            const tri = new Path2D();
+            tri.moveTo(x0, y0);
+            tri.lineTo(x1, y1);
+            tri.lineTo(x2, y2);
+            tri.closePath();
+
+            if (texture) {
+                // uv is 0..1 with (0,0) at the TOP LEFT and there is no v flip — the 3D path
+                // flips for the GL convention, 2D deliberately does not.
+                const u0 = m.uv[i0 * 2] * texW, v0 = m.uv[i0 * 2 + 1] * texH;
+                const u1 = m.uv[i1 * 2] * texW, v1 = m.uv[i1 * 2 + 1] * texH;
+                const u2 = m.uv[i2 * 2] * texW, v2 = m.uv[i2 * 2 + 1] * texH;
+                const det = (u1 - u0) * (v2 - v0) - (u2 - u0) * (v1 - v0);
+                if (Math.abs(det) < 1e-9) continue;
+                const a = ((x1 - x0) * (v2 - v0) - (x2 - x0) * (v1 - v0)) / det;
+                const b = ((y1 - y0) * (v2 - v0) - (y2 - y0) * (v1 - v0)) / det;
+                const c = ((x2 - x0) * (u1 - u0) - (x1 - x0) * (u2 - u0)) / det;
+                const d = ((y2 - y0) * (u1 - u0) - (y1 - y0) * (u2 - u0)) / det;
+                const e = x0 - a * u0 - c * v0;
+                const f = y0 - b * u0 - d * v0;
+                this.ctx.save();
+                this.ctx.clip(tri);
+                this.ctx.transform(a, b, c, d, e, f);
+                this.ctx.drawImage(texture as any, 0, 0);
+                this.ctx.restore();
+                continue;
+            }
+
+            if (m.colors.length === vertexCount) {
+                // The mean of the three: with no interpolation available it is the least wrong
+                // single colour for the face.
+                const c0 = m.colors[i0], c1 = m.colors[i1], c2 = m.colors[i2];
+                const av = (sh: number) =>
+                    Math.round((((c0 >>> sh) & 0xff) + ((c1 >>> sh) & 0xff)
+                                + ((c2 >>> sh) & 0xff)) / 3);
+                const alpha = av(24) / 255;
+                this.ctx.fillStyle = 'rgba(' + av(16) + ',' + av(8) + ',' + av(0) + ','
+                                   + alpha + ')';
+                this.ctx.fill(tri);
+            } else {
+                // applyFillStyle, not a bare fill: fillStyle carries whatever the last text or
+                // shape left behind, so filling directly paints the mesh in the previous
+                // colour — grey from a label, or black on a dark background, which reads as the
+                // mesh having failed to draw at all.
+                this.applyFillStyle();
+                this.ctx.fill(tri);
+            }
+        }
+        this.ctx.restore();
+    }
+
+    matrixFromMesh(meshId: number, u: number, v: number, flags: number): void {
+        const m = this.meshCache.get(meshId);
+        if (!m) return;
+        const frame = new Float32Array(6);
+        if (!meshSampleFrame(m.layout, m.uCount, m.vCount, m.verts, u, v, frame)) return;
+        const out = new Float32Array(6);   // duX, duY, dvX, dvY, originX, originY
+        meshBuildMatrix(frame, flags, out);
+        // The affine maps the (u, v) basis: x' = duX*x + dvX*y + originX. ctx.transform takes
+        // (a, b, c, d, e, f) as x' = a*x + c*y + e, so du is (a, b) and dv is (c, d) — the
+        // same column convention buildMatrix emits.
+        this.ctx.transform(out[0], out[1], out[2], out[3], out[4], out[5]);
+    }
+
+    drawPath(id: number, start: number, end: number): void {
+        const data = this.pathDataCache.get(id);
+        if (!data) return;
+        const path = this.buildPath2D(data, start, end);
+        this.fillOrStroke(
+            () => { this.ctx.fill(path); },
+            () => { this.ctx.stroke(path); }
+        );
+    }
+
+    drawTextRun(textId: number, start: number, end: number,
+                _contextStart: number, _contextEnd: number,
+                x: number, y: number, _rtl: boolean): void {
+        const text = this.textCache.get(textId);
+        if (!text) return;
+        const s = start >= 0 ? start : 0;
+        const e = end >= 0 ? Math.min(end, text.length) : text.length;
+        const substr = text.substring(s, e);
+        this.setFont();
+        this.fillOrStroke(
+            () => { this.applyFillStyle(); this.ctx.fillText(substr, x, y); },
+            () => { this.applyStrokeStyle(); this.ctx.strokeText(substr, x, y); }
+        );
+    }
+
+    drawTextOnPath(textId: number, pathId: number, hOffset: number, vOffset: number): void {
+        const text = this.textCache.get(textId);
+        if (!text) return;
+        const data = this.pathDataCache.get(pathId);
+        if (!data) return;
+
+        const { segments, totalLen } = this.collectPathSegments(data);
+        if (totalLen === 0 || segments.length === 0) return;
+
+        this.setFont();
+        this.ctx.textBaseline = 'alphabetic';
+        let progress = hOffset;
+
+        for (let ci = 0; ci < text.length; ci++) {
+            const ch = text[ci];
+            const charWidth = this.ctx.measureText(ch).width;
+            const charCenter = progress + charWidth / 2;
+
+            if (charCenter >= 0 && charCenter <= totalLen) {
+                this.ctx.save();
+                const at = this.positionOnPath(segments, charCenter, vOffset);
+                // Re-express any gradient in this glyph's own space, or it is sampled from
+                // a rotated, displaced one and the glyph fills with the wrong colour.
+                const g = at ? this.fillStyleUnderGlyph(at.x, at.y, at.angle) : null;
+                this.fillOrStroke(
+                    () => { this.applyFillStyle(g); this.ctx.fillText(ch, -charWidth / 2, 0); },
+                    () => { this.applyStrokeStyle(g); this.ctx.strokeText(ch, -charWidth / 2, 0); }
+                );
+                this.ctx.restore();
+            }
+            progress += charWidth;
+        }
+    }
+
+    private mTextMeasureCache = new Map<string, any>();
+
+    private measureTextCached(text: string): any {
+        const key = `${this.ctx.font}:::${text}`;
+        let res = this.mTextMeasureCache.get(key);
+        if (!res) {
+            res = this.ctx.measureText(text);
+            this.mTextMeasureCache.set(key, res);
+            if (this.mTextMeasureCache.size > 2000) {
+                this.mTextMeasureCache.clear();
+                this.mTextMeasureCache.set(key, res);
+            }
+        }
+        return res;
+    }
+
+    /**
+     * Measure text the way the Java reference's headless MockRemoteContext does (getTextBounds:
+     * always 100x10; layoutComplexText: 30 per character x 40), for conformance runs against
+     * that reference (players/conformance). Set it before loading; it changes layout, so it is
+     * never on in a real player.
+     */
+    static mockTextMetrics = !!(globalThis as any).process?.env?.RC_MOCK_TEXT;
+
+    getTextBounds(textId: number, start: number, end: number, flags: number, bounds: Float32Array): void {
+        if (CanvasPaintContext.mockTextMetrics) {
+            bounds[0] = 0; bounds[1] = 0; bounds[2] = 100; bounds[3] = 10;
+            return;
+        }
+        const text = this.textCache.get(textId);
+        if (!text) { bounds.fill(0); return; }
+        const s = start >= 0 ? start : 0;
+        const e = end >= 0 ? Math.min(end, text.length) : text.length;
+        const substr = text.substring(s, e);
+        this.setFont();
+        const metrics: any = this.measureTextCached(substr);
+
+        // Vertical extent, in order of preference:
+        //   1. the font box, which is what TEXT_MEASURE_FONT_HEIGHT asks for and what
+        //      makes a line of digits the same height as one with descenders;
+        //   2. the glyph ink box;
+        //   3. an estimate proportional to the text size.
+        //
+        // The estimate is the important part. Where the canvas reports no metrics at all
+        // — some fonts, some emoji, some headless builds — the first two are 0, height
+        // came back 0, and text laid out with a real width and no height whatsoever, so
+        // it never painted. The ratios are approximate on purpose: a proportional,
+        // deterministic height is what layout needs, and exact agreement with a real font
+        // was never on offer here.
+        const size = this.textSize > 0 ? this.textSize : DEFAULT_TEXT_SIZE;
+        const wantFontBox = (flags & 0x02 /* TEXT_MEASURE_FONT_HEIGHT */) !== 0;
+        const pick = (...vals: any[]) => {
+            for (const v of vals) if (typeof v === 'number' && isFinite(v) && v > 0) return v;
+            return 0;
+        };
+        // A font height never falls back to the ink box: "Home" has no descender and a short
+        // ink box, so a line laid out from it overlaps the next (node-canvas has no font box).
+        // Without a font box it is the estimate below, which is proportional like a font's.
+        let ascent = wantFontBox
+            ? pick(metrics.fontBoundingBoxAscent)
+            : pick(metrics.actualBoundingBoxAscent, metrics.fontBoundingBoxAscent);
+        let descent = wantFontBox
+            ? pick(metrics.fontBoundingBoxDescent)
+            : pick(metrics.actualBoundingBoxDescent, metrics.fontBoundingBoxDescent);
+        if (ascent <= 0 && descent <= 0) {
+            // Calibrated against a device: text size 18 measured a ~20.8px line there,
+            // split about 0.92 / 0.24 the way Roboto's own metrics are.
+            ascent = ASCENT_RATIO * size;
+            descent = DESCENT_RATIO * size;
+        }
+
+        bounds[0] = 0;
+        bounds[1] = -ascent;
+        bounds[2] = pick(metrics.width, substr.length * AVG_ADVANCE * size);
+        bounds[3] = descent;
+    }
+
+    layoutComplexText(textId: number, start: number, end: number, alignment: number,
+                      overflow: number, maxLines: number, maxWidth: number, maxHeight: number,
+                      _letterSpacing: number, _lineHeightAdd: number, lineHeightMultiplier: number,
+                      _lineBreakStrategy: number, _hyphenationFrequency: number,
+                      _justificationMode: number, _useUnderline: boolean,
+                      _strikethrough: boolean, _flags: number): any {
+        const str = this.textCache.get(textId);
+        if (!str) return null;
+        if (CanvasPaintContext.mockTextMetrics) {
+            // MockRemoteContext.layoutComplexText: getText(textId).length * 30, by 40.
+            return { lines: [str], alignment, lineHeight: 40, width: str.length * 30, height: 40,
+                     maxWidth, maxHeight, visibleLines: 1 };
+        }
+        const s = start >= 0 ? start : 0;
+        const e = (end === -1 || end > str.length) ? str.length : end;
+        const text = str.substring(s, e);
+
+        this.setFont();
+        // Guard the text size the same way getTextBounds does. A zero size here produced
+        // a layout with a real width and zero height, so the text occupied no space and
+        // never painted — with nothing anywhere reporting an error.
+        const size = this.textSize > 0 ? this.textSize : DEFAULT_TEXT_SIZE;
+        const lineHeight = size * (lineHeightMultiplier || 1.2);
+
+        // Fast-path: single paragraph that fits within maxWidth on one line
+        if (!text.includes('\n')) {
+            const metrics = this.measureTextCached(text);
+            if (metrics.width <= maxWidth || maxWidth <= 0 || maxLines === 1) {
+                let lines = [text];
+                let width = metrics.width;
+                if (CanvasPaintContext.isEllipsis(overflow) && maxWidth > 0 && metrics.width > maxWidth) {
+                    lines = [this.ellipsize(text, maxWidth, overflow)];
+                    width = this.measureTextCached(lines[0]).width;
+                }
+                return {
+                    lines,
+                    alignment,
+                    lineHeight,
+                    width,
+                    height: lineHeight,
+                    maxWidth,
+                    maxHeight,
+                    visibleLines: lines.length
+                };
+            }
+        }
+
+        // Word-wrap text to fit maxWidth, honoring embedded newlines as hard breaks
+        const lines: string[] = [];
+        // Whether maxLines cut the text, and how much of it the kept lines cover.
+        let truncated = false;
+        let consumed = 0;
+        // First split on hard newlines, then word-wrap each paragraph
+        const paragraphs = text.split('\n');
+        let paraStart = 0;
+        for (let pi = 0; pi < paragraphs.length; pi++) {
+            if (maxLines > 0 && lines.length >= maxLines) { truncated = true; break; }
+            const para = paragraphs[pi];
+            const words = para.split(/(\s+)/);
+            let currentLine = '';
+            let pos = paraStart;
+            for (const word of words) {
+                const testLine = currentLine + word;
+                const metrics = this.measureTextCached(testLine);
+                if (metrics.width > maxWidth && currentLine.length > 0) {
+                    lines.push(currentLine);
+                    consumed = pos;
+                    currentLine = word.trimStart();
+                    if (maxLines > 0 && lines.length >= maxLines) { truncated = true; break; }
+                } else {
+                    currentLine = testLine;
+                }
+                pos += word.length;
+            }
+            if (truncated) break;
+            if (currentLine.length > 0 && (maxLines <= 0 || lines.length < maxLines)) {
+                lines.push(currentLine);
+                consumed = paraStart + para.length;
+            } else if (para.length === 0 && (maxLines <= 0 || lines.length < maxLines)) {
+                // Empty paragraph = blank line from consecutive \n
+                lines.push('');
+                consumed = paraStart;
+            }
+            paraStart += para.length + 1;
+        }
+        if (consumed < text.length && maxLines > 0 && lines.length >= maxLines) truncated = true;
+
+        // Ellipsize the last line when the text was cut by maxLines, as StaticLayout does with
+        // setEllipsize (AndroidPaintContext.layoutComplexText maps OVERFLOW_ELLIPSIS to END,
+        // START_ELLIPSIS to START, MIDDLE_ELLIPSIS to MIDDLE). The remainder of the text is
+        // folded into that line first, so END shows where it was cut.
+        if (CanvasPaintContext.isEllipsis(overflow) && maxLines > 0 && lines.length >= maxLines
+            && truncated) {
+            const lastIdx = maxLines - 1;
+            lines.length = maxLines;
+            lines[lastIdx] = this.ellipsize(lines[lastIdx] + ' ' + text.substring(consumed).trimStart(),
+                                            maxWidth, overflow, true);
+        }
+
+        // Compute total dimensions
+        let totalWidth = 0;
+        for (const line of lines) {
+            const w = this.measureTextCached(line).width;
+            if (w > totalWidth) totalWidth = w;
+        }
+        const totalHeight = lines.length * lineHeight;
+
+        // AndroidPaintContext: when an ellipsized layout is taller than maxHeight, count the
+        // lines whose bottom is inside it; CoreText then lays out again with that many lines.
+        let visibleLines = lines.length;
+        if (totalHeight > maxHeight && CanvasPaintContext.isEllipsis(overflow)
+            && lines.length >= maxLines) {
+            visibleLines = 0;
+            for (let i = 0; i < lines.length; i++) {
+                if ((i + 1) * lineHeight < maxHeight) visibleLines++;
+                else break;
+            }
+        }
+
+        return {
+            lines, alignment, lineHeight,
+            width: totalWidth,
+            height: totalHeight,
+            maxWidth,
+            maxHeight,
+            visibleLines
+        };
+    }
+
+    private static isEllipsis(overflow: number): boolean {
+        // CoreText.OVERFLOW_ELLIPSIS (3), OVERFLOW_START_ELLIPSIS (4), OVERFLOW_MIDDLE_ELLIPSIS (5)
+        return overflow === 3 || overflow === 4 || overflow === 5;
+    }
+
+    /**
+     * TextUtils.ellipsize: fit `text` in maxWidth with a "\u2026", cut at the end (END),
+     * the start (START) or the middle (MIDDLE). `force` adds the ellipsis even when the text
+     * fits, for a last line that maxLines cut short.
+     */
+    private ellipsize(text: string, maxWidth: number, overflow: number, force = false): string {
+        const ELLIPSIS = '\u2026';
+        if (!force && this.measureTextCached(text).width <= maxWidth) return text;
+        const fits = (t: string) => this.measureTextCached(t).width <= maxWidth;
+        if (overflow === 4) {
+            let keep = text.length;
+            while (keep > 0 && !fits(ELLIPSIS + text.substring(text.length - keep))) keep--;
+            return ELLIPSIS + text.substring(text.length - keep).trimStart();
+        }
+        if (overflow === 5) {
+            let keep = text.length;
+            while (keep > 0) {
+                const head = text.substring(0, Math.ceil(keep / 2));
+                const tail = text.substring(text.length - Math.floor(keep / 2));
+                if (fits(head + ELLIPSIS + tail)) return head + ELLIPSIS + tail;
+                keep--;
+            }
+            return ELLIPSIS;
+        }
+        let keep = text.length;
+        while (keep > 0 && !fits(text.substring(0, keep).trimEnd() + ELLIPSIS)) keep--;
+        return text.substring(0, keep).trimEnd() + ELLIPSIS;
+    }
+
+    drawComplexText(computedTextLayout: any, targetWidth?: number): void {
+        if (!computedTextLayout) return;
+        const { lines, alignment, lineHeight, width } = computedTextLayout;
+        const layoutWidth = (typeof targetWidth === 'number' && targetWidth > 0) ? targetWidth : width;
+        this.setFont();
+        this.ctx.textBaseline = 'top';
+        const align = (typeof alignment === 'number') ? (alignment & 0xFFFF) : 1;
+        for (let i = 0; i < lines.length; i++) {
+            let x = 0;
+            const lineW = this.measureTextCached(lines[i]).width;
+            if (align === 2 || align === 6) {
+                // RIGHT (2) / END (6)
+                x = layoutWidth - lineW;
+            } else if (align === 3) {
+                // CENTER (3)
+                x = (layoutWidth - lineW) / 2;
+            }
+            this.fillOrStroke(
+                () => { this.applyFillStyle(); this.ctx.fillText(lines[i], x, i * lineHeight); },
+                () => { this.applyStrokeStyle(); this.ctx.strokeText(lines[i], x, i * lineHeight); }
+            );
+        }
+    }
+
+    drawBitmap(imageId: number, srcLeft: number, srcTop: number, srcRight: number, srcBottom: number,
+               dstLeft: number, dstTop: number, dstRight: number, dstBottom: number, _cdId: number): void {
+        const img = this.bitmapToDraw(imageId);
+        if (!img) return;
+        this.ctx.globalAlpha = this.alpha * this.mLayerAlpha;
+        this.ctx.globalCompositeOperation = this.blendMode;
+        this.ctx.imageSmoothingEnabled = this.filterBitmap;
+        const sw = srcRight - srcLeft;
+        const sh = srcBottom - srcTop;
+        const dw = dstRight - dstLeft;
+        const dh = dstBottom - dstTop;
+        if (sw > 0 && sh > 0) {
+            this.ctx.drawImage(img, srcLeft, srcTop, sw, sh, dstLeft, dstTop, dw, dh);
+        } else {
+            this.ctx.drawImage(img, dstLeft, dstTop, dw, dh);
+        }
+    }
+
+    drawBitmapSimple(id: number, left: number, top: number, right: number, bottom: number): void {
+        const img = this.bitmapToDraw(id);
+        if (!img) return;
+        this.ctx.globalAlpha = this.alpha * this.mLayerAlpha;
+        this.ctx.globalCompositeOperation = this.blendMode;
+        this.ctx.imageSmoothingEnabled = this.filterBitmap;
+        this.ctx.drawImage(img, left, top, right - left, bottom - top);
+    }
+
+    drawTweenPath(path1Id: number, path2Id: number, tween: number, start: number, end: number): void {
+        const data1 = this.pathDataCache.get(path1Id);
+        const data2 = this.pathDataCache.get(path2Id);
+        if (!data1 || !data2) {
+            if (data1) this.drawPath(path1Id, start, end);
+            return;
+        }
+        // Interpolate path data: commands stay the same, coordinates are lerped.
+        // Operate on raw bits; decode coords via intBitsToFloat, re-encode result.
+        const len = Math.min(data1.length, data2.length);
+        const tweened = new Int32Array(len);
+        for (let i = 0; i < len; i++) {
+            const b1 = data1[i];
+            if (isNaNBits(b1)) {
+                // Command code / marker - keep bits from path1
+                tweened[i] = b1;
+            } else {
+                // Coordinate value - interpolate in float space, re-encode to bits
+                const f1 = intBitsToFloat(b1);
+                const f2 = intBitsToFloat(data2[i]);
+                tweened[i] = floatToRawIntBits(f1 + (f2 - f1) * tween);
+            }
+        }
+        const path = this.buildPath2D(tweened, start, end);
+        this.fillOrStroke(
+            () => { this.ctx.fill(path); },
+            () => { this.ctx.stroke(path); }
+        );
+    }
+
+    tweenPath(out: number, path1: number, path2: number, tween: number): void {
+        if (tween === 0) {
+            const data = this.pathDataCache.get(path1);
+            if (data) this.pathDataCache.set(out, Int32Array.from(data));
+            return;
+        }
+        if (tween === 1) {
+            const data = this.pathDataCache.get(path2);
+            if (data) this.pathDataCache.set(out, Int32Array.from(data));
+            return;
+        }
+        const data1 = this.pathDataCache.get(path1);
+        const data2 = this.pathDataCache.get(path2);
+        if (!data1 || !data2) return;
+        const len = Math.min(data1.length, data2.length);
+        const result = new Int32Array(len);
+        for (let i = 0; i < len; i++) {
+            if (isNaNBits(data1[i]) || isNaNBits(data2[i])) {
+                result[i] = data1[i]; // command code / marker - keep bits from path1
+            } else {
+                const f1 = intBitsToFloat(data1[i]);
+                const f2 = intBitsToFloat(data2[i]);
+                result[i] = floatToRawIntBits((f2 - f1) * tween + f1);
+            }
+        }
+        this.pathDataCache.set(out, result);
+    }
+
+    combinePath(_out: number, _path1: number, _path2: number, _operation: number): void {
+        // Path boolean operations (DIFFERENCE, INTERSECT, UNION, XOR, REVERSE_DIFFERENCE)
+        // not natively supported in Canvas 2D API
+    }
+
+    // --- Matrix / transforms ---
+
+    scale(scaleX: number, scaleY: number): void {
+        // Clamp exactly-zero scale to near-zero to avoid corrupting canvas state.
+        // node-canvas (Cairo) permanently breaks after ctx.scale(0, ...) — even
+        // ctx.restore() cannot undo the damage.  A tiny epsilon is visually
+        // identical to zero but keeps the transform matrix non-singular.
+        const eps = 1e-10;
+        if (scaleX === 0) scaleX = eps;
+        if (scaleY === 0) scaleY = eps;
+        this.ctx.scale(scaleX, scaleY);
+    }
+    translate(translateX: number, translateY: number): void { this.ctx.translate(translateX, translateY); }
+
+    // The alpha of the enclosing saveLayer()s (an enter/exit fade): every draw sets
+    // globalAlpha from its paint, so the layer's alpha is multiplied in there. It follows the
+    // canvas save stack.
+    private mLayerAlpha = 1;
+    private mLayerAlphaStack: number[] = [];
+    matrixSave(): void { this.mLayerAlphaStack.push(this.mLayerAlpha); this.ctx.save(); }
+    matrixRestore(): void {
+        if (this.mLayerAlphaStack.length) this.mLayerAlpha = this.mLayerAlphaStack.pop()!;
+        this.ctx.restore();
+    }
+
+    override saveLayer(x: number, y: number, w: number, h: number): void {
+        this.mLayerAlphaStack.push(this.mLayerAlpha);
+        this.ctx.save();
+        this.ctx.beginPath();
+        this.ctx.rect(x, y, w, h);
+        this.ctx.clip();
+        if (this.alpha < 1) {
+            this.mLayerAlpha *= this.alpha;
+            this.ctx.globalAlpha = this.mLayerAlpha;
+        }
+    }
+
+    matrixTranslate(tx: number, ty: number): void { this.ctx.translate(tx, ty); }
+    matrixScale(sx: number, sy: number, cx: number, cy: number): void {
+        // Clamp exactly-zero scale to near-zero to avoid corrupting canvas state.
+        // node-canvas (Cairo) permanently breaks after ctx.scale(0, ...) — even
+        // ctx.restore() cannot undo the damage.  A tiny epsilon is visually
+        // identical to zero but keeps the transform matrix non-singular.
+        const eps = 1e-10;
+        if (sx === 0) sx = eps;
+        if (sy === 0) sy = eps;
+        this.ctx.translate(cx, cy);
+        this.ctx.scale(sx, sy);
+        this.ctx.translate(-cx, -cy);
+    }
+
+    matrixRotate(angle: number, px: number, py: number): void {
+        this.ctx.translate(px, py);
+        this.ctx.rotate((angle * Math.PI) / 180);
+        this.ctx.translate(-px, -py);
+    }
+
+    matrixSkew(sx: number, sy: number): void {
+        this.ctx.transform(1, sy, sx, 1, 0, 0);
+    }
+
+    matrixFromPath(pathId: number, fraction: number, vOffset: number, _flags: number): void {
+        const data = this.pathDataCache.get(pathId);
+        if (!data) return;
+
+        const { segments, totalLen } = this.collectPathSegments(data);
+        if (totalLen === 0) return;
+
+        let target = (totalLen * fraction) % totalLen;
+        if (target < 0) target += totalLen;
+
+        this.positionOnPath(segments, target, vOffset);
+    }
+
+    // --- Path measurement helpers ---
+
+    /** Flatten path data into line segments (curves are subdivided). */
+    private collectPathSegments(data: Int32Array): {
+        segments: { x1: number; y1: number; x2: number; y2: number; len: number }[];
+        totalLen: number;
+    } {
+        type Seg = { x1: number; y1: number; x2: number; y2: number; len: number };
+        const segments: Seg[] = [];
+        let curX = 0, curY = 0, startX = 0, startY = 0;
+        let i = 0;
+
+        const addLine = (x1: number, y1: number, x2: number, y2: number) => {
+            const dx = x2 - x1, dy = y2 - y1;
+            const len = Math.sqrt(dx * dx + dy * dy);
+            if (len > 0) segments.push({ x1, y1, x2, y2, len });
+        };
+
+        while (i < data.length) {
+            const bits = data[i];
+            let cmd = isNaNBits(bits) ? idFromBits(bits) : intBitsToFloat(bits);
+            if (cmd >= CanvasPaintContext.NANMAP_PATH_BASE && cmd <= CanvasPaintContext.NANMAP_PATH_BASE + 6) {
+                cmd = CanvasPaintContext.PATH_MOVE + (cmd - CanvasPaintContext.NANMAP_PATH_BASE);
+            }
+            switch (cmd) {
+                case CanvasPaintContext.PATH_MOVE:
+                    i++; curX = startX = intBitsToFloat(data[i]); curY = startY = intBitsToFloat(data[i + 1]); i += 2; break;
+                case CanvasPaintContext.PATH_LINE: {
+                    i += 3;
+                    const ex = intBitsToFloat(data[i]), ey = intBitsToFloat(data[i + 1]); i += 2;
+                    addLine(curX, curY, ex, ey);
+                    curX = ex; curY = ey; break;
+                }
+                case CanvasPaintContext.PATH_QUADRATIC: {
+                    i += 3;
+                    const cpx = intBitsToFloat(data[i]), cpy = intBitsToFloat(data[i + 1]);
+                    const ex = intBitsToFloat(data[i + 2]), ey = intBitsToFloat(data[i + 3]); i += 4;
+                    this.flattenQuadratic(curX, curY, cpx, cpy, ex, ey, addLine);
+                    curX = ex; curY = ey; break;
+                }
+                case CanvasPaintContext.PATH_CONIC: {
+                    i += 3;
+                    const cpx = intBitsToFloat(data[i]), cpy = intBitsToFloat(data[i + 1]);
+                    const ex = intBitsToFloat(data[i + 2]), ey = intBitsToFloat(data[i + 3]);
+                    i += 5; // skip weight
+                    this.flattenQuadratic(curX, curY, cpx, cpy, ex, ey, addLine);
+                    curX = ex; curY = ey; break;
+                }
+                case CanvasPaintContext.PATH_CUBIC: {
+                    i += 3;
+                    const cp1x = intBitsToFloat(data[i]), cp1y = intBitsToFloat(data[i + 1]);
+                    const cp2x = intBitsToFloat(data[i + 2]), cp2y = intBitsToFloat(data[i + 3]);
+                    const ex = intBitsToFloat(data[i + 4]), ey = intBitsToFloat(data[i + 5]); i += 6;
+                    this.flattenCubic(curX, curY, cp1x, cp1y, cp2x, cp2y, ex, ey, addLine);
+                    curX = ex; curY = ey; break;
+                }
+                case CanvasPaintContext.PATH_CLOSE: {
+                    i++;
+                    addLine(curX, curY, startX, startY);
+                    curX = startX; curY = startY; break;
+                }
+                case CanvasPaintContext.PATH_DONE: i = data.length; break;
+                default: i++; break;
+            }
+        }
+        let totalLen = 0;
+        for (const s of segments) totalLen += s.len;
+        return { segments, totalLen };
+    }
+
+    /** Subdivide a quadratic bezier into line segments. */
+    private flattenQuadratic(
+        x0: number, y0: number, cpx: number, cpy: number, x1: number, y1: number,
+        addLine: (x1: number, y1: number, x2: number, y2: number) => void
+    ): void {
+        const N = 16;
+        let px = x0, py = y0;
+        for (let j = 1; j <= N; j++) {
+            const t = j / N, mt = 1 - t;
+            const x = mt * mt * x0 + 2 * mt * t * cpx + t * t * x1;
+            const y = mt * mt * y0 + 2 * mt * t * cpy + t * t * y1;
+            addLine(px, py, x, y);
+            px = x; py = y;
+        }
+    }
+
+    /** Subdivide a cubic bezier into line segments. */
+    private flattenCubic(
+        x0: number, y0: number, cp1x: number, cp1y: number,
+        cp2x: number, cp2y: number, x1: number, y1: number,
+        addLine: (x1: number, y1: number, x2: number, y2: number) => void
+    ): void {
+        const N = 16;
+        let px = x0, py = y0;
+        for (let j = 1; j <= N; j++) {
+            const t = j / N, mt = 1 - t;
+            const x = mt*mt*mt*x0 + 3*mt*mt*t*cp1x + 3*mt*t*t*cp2x + t*t*t*x1;
+            const y = mt*mt*mt*y0 + 3*mt*mt*t*cp1y + 3*mt*t*t*cp2y + t*t*t*y1;
+            addLine(px, py, x, y);
+            px = x; py = y;
+        }
+    }
+
+    /** Translate and rotate the canvas to a point at the given distance along segments. */
+    private positionOnPath(
+        segments: { x1: number; y1: number; x2: number; y2: number; len: number }[],
+        distance: number, vOffset: number
+    ): { x: number; y: number; angle: number } | null {
+        let accum = 0;
+        for (const s of segments) {
+            if (accum + s.len >= distance || s === segments[segments.length - 1]) {
+                const t = s.len > 0 ? (distance - accum) / s.len : 0;
+                const px = s.x1 + (s.x2 - s.x1) * t;
+                const py = s.y1 + (s.y2 - s.y1) * t;
+                const angle = Math.atan2(s.y2 - s.y1, s.x2 - s.x1);
+                // Apply vOffset perpendicular to the path tangent
+                const nx = -Math.sin(angle) * vOffset;
+                const ny =  Math.cos(angle) * vOffset;
+                this.ctx.translate(px + nx, py + ny);
+                this.ctx.rotate(angle);
+                return { x: px + nx, y: py + ny, angle };
+            }
+            accum += s.len;
+        }
+        return null;
+    }
+
+    // --- Clipping ---
+
+    clipRect(left: number, top: number, right: number, bottom: number): void {
+        this.ctx.beginPath();
+        this.ctx.rect(left, top, right - left, bottom - top);
+        this.ctx.clip();
+    }
+
+    clipPath(pathId: number, _regionOp: number): void {
+        const data = this.pathDataCache.get(pathId);
+        if (!data) return;
+        const path = this.buildPath2D(data);
+        this.ctx.clip(path);
+    }
+
+    roundedClipRect(width: number, height: number, topStart: number, topEnd: number,
+                    bottomStart: number, bottomEnd: number): void {
+        this.ctx.beginPath();
+        this.ctx.roundRect(0, 0, width, height, [topStart, topEnd, bottomEnd, bottomStart].map((r) => Math.max(0, r)));
+        this.ctx.clip();
+    }
+
+    // --- Graphics layer (offscreen compositing) ---
+
+    // GraphicsLayer attribute IDs (from GraphicsLayerModifierOperation.java)
+    private static readonly GL_SCALE_X = 0;
+    private static readonly GL_SCALE_Y = 1;
+    private static readonly GL_ROTATION_Z = 4;
+    private static readonly GL_TRANSFORM_ORIGIN_X = 5;
+    private static readonly GL_TRANSFORM_ORIGIN_Y = 6;
+    private static readonly GL_TRANSLATION_X = 7;
+    private static readonly GL_TRANSLATION_Y = 8;
+    private static readonly GL_ALPHA = 11;
+    private static readonly GL_SHAPE = 20;
+    private static readonly GL_SHAPE_RADIUS = 21;
+
+    startGraphicsLayer(w: number, h: number): void {
+        this.ctx.save();
+        try {
+            const offCtx = this.createLayerCanvas(w, h);
+            this.layerStack.push({
+                previousCtx: this.ctx,
+                offscreenCanvas: offCtx.canvas,
+                width: w,
+                height: h,
+                attributes: new Map()
+            });
+            this.ctx = offCtx;
+        } catch (_e) {
+            // Fallback: no layer isolation, just use save/restore
+        }
+    }
+
+    setGraphicsLayer(attributes: Map<number, any>): void {
+        const layer = this.layerStack[this.layerStack.length - 1];
+        if (layer) {
+            layer.attributes = attributes;
+        }
+    }
+
+    endGraphicsLayer(): void {
+        const layer = this.layerStack.pop();
+        if (!layer) {
+            this.ctx.restore();
+            return;
+        }
+
+        const layerCanvas = layer.offscreenCanvas;
+        this.ctx = layer.previousCtx;
+
+        // Apply transforms from layer attributes before compositing
+        const attrs = layer.attributes;
+        const scaleX = (attrs.get(CanvasPaintContext.GL_SCALE_X) as number) ?? 1;
+        const scaleY = (attrs.get(CanvasPaintContext.GL_SCALE_Y) as number) ?? 1;
+        const rotationZ = (attrs.get(CanvasPaintContext.GL_ROTATION_Z) as number) ?? 0;
+        const transX = (attrs.get(CanvasPaintContext.GL_TRANSLATION_X) as number) ?? 0;
+        const transY = (attrs.get(CanvasPaintContext.GL_TRANSLATION_Y) as number) ?? 0;
+        const originX = (attrs.get(CanvasPaintContext.GL_TRANSFORM_ORIGIN_X) as number) ?? 0.5;
+        const originY = (attrs.get(CanvasPaintContext.GL_TRANSFORM_ORIGIN_Y) as number) ?? 0.5;
+        const alpha = (attrs.get(CanvasPaintContext.GL_ALPHA) as number) ?? 1;
+        const shape = attrs.get(CanvasPaintContext.GL_SHAPE) as number | undefined;
+        const shapeRadius = (attrs.get(CanvasPaintContext.GL_SHAPE_RADIUS) as number) ?? 0;
+
+        const pivotX = originX * layer.width;
+        const pivotY = originY * layer.height;
+
+        const hasTransform = scaleX !== 1 || scaleY !== 1 || rotationZ !== 0 || transX !== 0 || transY !== 0;
+
+        if (hasTransform) {
+            this.ctx.translate(pivotX + transX, pivotY + transY);
+            if (rotationZ !== 0) {
+                this.ctx.rotate((rotationZ * Math.PI) / 180);
+            }
+            if (scaleX !== 1 || scaleY !== 1) {
+                this.ctx.scale(scaleX, scaleY);
+            }
+            this.ctx.translate(-pivotX, -pivotY);
+        }
+
+        // Apply clip shape if specified
+        if (shape !== undefined) {
+            this.ctx.beginPath();
+            if (shape === 2) {
+                // Circle
+                const r = Math.min(layer.width, layer.height) / 2;
+                this.ctx.arc(layer.width / 2, layer.height / 2, r, 0, Math.PI * 2);
+            } else if (shape === 1 && shapeRadius > 0) {
+                // Round rect
+                this.ctx.roundRect(0, 0, layer.width, layer.height, [Math.max(0, shapeRadius)]);
+            } else {
+                // Rect
+                this.ctx.rect(0, 0, layer.width, layer.height);
+            }
+            this.ctx.clip();
+        }
+
+        // Set layer alpha
+        if (alpha !== 1) {
+            this.ctx.globalAlpha = alpha;
+        }
+
+        // Composite the offscreen layer onto the main canvas
+        this.ctx.drawImage(layerCanvas, 0, 0);
+
+        this.ctx.restore();
+    }
+
+    private mainCanvas: CanvasRenderingContext2D | null = null;
+    private bitmapCanvasCache = new Map<number, CanvasRenderingContext2D>();
+    /** Declared size of a pixel-less bitmap, so its buffer is allocated at that size. */
+    private emptyBitmapSizes = new Map<number, { width: number; height: number }>();
+
+    drawToBitmap(bitmapId: number, mode: number, color: number): void {
+        if (this.mainCanvas === null) {
+            this.mainCanvas = this.ctx;
+        }
+        if (bitmapId === 0) {
+            // Return to main canvas
+            this.ctx = this.mainCanvas;
+            return;
+        }
+        // Get or create an offscreen canvas for this bitmap
+        let offCtx = this.bitmapCanvasCache.get(bitmapId);
+        if (!offCtx) {
+            // Prefer the size the document declared. A bitmap created with
+            // createBitmap(w, h) has no decoded image to measure, so before this the
+            // buffer silently became 256x256 whatever the document asked for — a
+            // simulation writing a 512x256 state grid got two thirds of it discarded,
+            // with no error anywhere. The 256 default now applies only to a buffer whose
+            // size nothing declared.
+            const declared = this.emptyBitmapSizes.get(bitmapId);
+            const img = this.bitmapCache.get(bitmapId);
+            const w = declared?.width || (img ? (img as any).width : 0) || 256;
+            const h = declared?.height || (img ? (img as any).height : 0) || 256;
+            offCtx = this.createLayerCanvas(w, h);
+            this.bitmapCanvasCache.set(bitmapId, offCtx);
+        }
+        if ((mode & 1) === 0) {
+            // Clear with the specified color
+            const canvas = offCtx.canvas;
+            offCtx.clearRect(0, 0, (canvas as any).width, (canvas as any).height);
+            if (color !== 0) {
+                offCtx.fillStyle = argbToRgba(color);
+                offCtx.fillRect(0, 0, (canvas as any).width, (canvas as any).height);
+            }
+        }
+        this.ctx = offCtx;
+    }
+
+    reset(): void {
+        this.resetPaintState();
+        this.clearNeedsRepaint();
+    }
+
+    // ---- 3D (Paint3DContext) -----------------------------------------------
+    //
+    // Only the software backend is implemented here. Every other backend in the mode word
+    // (canvas-vertices, drawMesh, GL) falls back to software, which is exactly what the
+    // reference does on a platform that lacks them — so a document renders the same picture
+    // rather than silently drawing nothing.
+
+    private d3: SoftwarePaint3DContext | null = null;
+    /** GPU rasterizer for the canvas backends; created on first use, null if WebGL2 is absent. */
+    private d3gl: WebGL3DRenderer | null = null;
+    private d3glMesh: CanvasMesh = createCanvasMesh();
+    /** Whether anything has been drawn into the GL canvas this 3D pass. */
+    private d3glDirty = false;
+    /** Texture generation last uploaded to GL, so an unchanged texture is not re-uploaded. */
+    private d3glTexGen = -1;
+    private d3Blit: CanvasRenderingContext2D | null = null;
+    /** The supersampling factor the 3D buffers were last sized with. */
+    private d3Super = 1;
+
+    /**
+     * Software 3D antialiasing: the 3D buffers are rendered this many times larger per axis
+     * and composited scaled down with smoothing (supersampling; the rasterizer itself has no
+     * coverage AA, so edges were fully aliased). 2x costs about 2.5-3.5x the 3D frame time
+     * (SHW-15 at 1280x800: 40 -> 136 ms), so it is off by default (1). 2 turns it on;
+     * "auto" uses 2 only up to about a megapixel of canvas (a phone or a window at density 1).
+     * RC.CanvasPaintContext.supersample3D, or per context.
+     */
+    static supersample3D: number | 'auto' = 1;
+    supersample3D: number | 'auto' = CanvasPaintContext.supersample3D;
+
+    private superFactor(): number {
+        const v = this.supersample3D;
+        if (v === 'auto') return this.ctx.canvas.width * this.ctx.canvas.height <= 1_050_000 ? 2 : 1;
+        return Math.max(1, Math.trunc(Number(v)) || 1);
+    }
+
+    private ensure3D(): SoftwarePaint3DContext {
+        const k = this.superFactor();
+        const w = this.ctx.canvas.width * k;
+        const h = this.ctx.canvas.height * k;
+        if (this.d3 === null) {
+            this.d3 = new SoftwarePaint3DContext();
+        }
+        this.d3.setSupersample(k);
+        this.d3Super = k;
+        this.d3.setSize(w, h);
+        if (this.d3Blit === null
+            || this.d3Blit.canvas.width !== w || this.d3Blit.canvas.height !== h) {
+            this.d3Blit = this.createLayerCanvas(w, h);
+        }
+        return this.d3;
+    }
+
+    defineMesh3D(id: number, indices: Int32Array, verts: Float32Array,
+                 normals: Float32Array | null, uv: Float32Array | null = null): void {
+        this.ensure3D().defineMesh3D(id, indices, verts, normals, uv);
+    }
+
+    setCamera3D(projection: number, projParams: Float32Array | number[],
+                viewParams: Float32Array | number[]): void {
+        this.ensure3D().setCamera3D(projection, projParams, viewParams);
+    }
+
+    matrix3Op(sub: number, args: Float32Array | number[]): void {
+        this.ensure3D().matrix3Op(sub, args);
+    }
+
+    clearDepth3D(): void {
+        this.ensure3D().clearDepth3D();
+    }
+
+    setLights3D(types: Int32Array | number[], colors: Int32Array | number[],
+                params: Float32Array | number[]): void {
+        this.ensure3D().setLights3D(types, colors, params);
+    }
+
+    setTexture3D(bitmapId: number): void {
+        const ctx3d = this.ensure3D();
+        if (bitmapId === 0) {
+            ctx3d.setTextureData(null, 0, 0);
+            return;
+        }
+        // Decoded bitmaps live in bitmapCache, not in RemoteComposeState — this used to ask
+        // the state and always got null, so every textured mesh rendered untextured in both
+        // the software and WebGL paths while the document itself was fine.
+        const img = this.bitmapCache.get(bitmapId);
+        if (!img) {
+            // loadBitmap decodes asynchronously, so a texture can legitimately be missing on
+            // the first frame and present on the next. Drawing untextured now is right;
+            // caching the miss would make it permanent.
+            ctx3d.setTextureData(null, 0, 0);
+            return;
+        }
+        const cached = this.texturePixels.get(bitmapId);
+        if (cached) {
+            ctx3d.setTextureData(cached.argb, cached.width, cached.height);
+            return;
+        }
+        const w = (img as HTMLImageElement).naturalWidth || img.width;
+        const h = (img as HTMLImageElement).naturalHeight || img.height;
+        if (!w || !h) {
+            ctx3d.setTextureData(null, 0, 0);
+            return;
+        }
+        // Extracted once per bitmap and kept: setTexture3D runs per mesh per frame, and
+        // getImageData is a readback that would otherwise dominate a textured 3D document.
+        const scratch = document.createElement('canvas');
+        scratch.width = w;
+        scratch.height = h;
+        const sctx = scratch.getContext('2d', { willReadFrequently: true });
+        if (!sctx) {
+            ctx3d.setTextureData(null, 0, 0);
+            return;
+        }
+        sctx.drawImage(img as CanvasImageSource, 0, 0);
+        const data = sctx.getImageData(0, 0, w, h).data;
+        const argb = new Int32Array(w * h);
+        for (let i = 0; i < w * h; i++) {
+            argb[i] = ((data[i * 4 + 3] << 24) | (data[i * 4] << 16)
+                | (data[i * 4 + 1] << 8) | data[i * 4 + 2]) | 0;
+        }
+        this.texturePixels.set(bitmapId, { argb, width: w, height: h });
+        ctx3d.setTextureData(argb, w, h);
+    }
+
+    setMaterial3D(specStrength: number, shininess: number): void {
+        this.ensure3D().setMaterial3D(specStrength, shininess);
+    }
+
+    setDepthBias3D(constant: number, slope: number): void {
+        this.ensure3D().setDepthBias3D(constant, slope);
+    }
+
+    drawMesh3D(meshId: number, mode: number): void {
+        const ctx3d = this.ensure3D();
+        ctx3d.setBaseColorArgb(this.colorArgb);
+
+        // Wireframe is hidden-line and needs the depth buffer the software path owns, so the
+        // contract forces software regardless of the backend bits.
+        const backend = mode >> 1;
+        const wire = (mode & MODE_WIREFRAME) !== 0;
+        if (!wire && (backend === MODE_BACKEND_CANVAS || backend === MODE_BACKEND_CANVAS_ZBUF)) {
+            if (this.drawMesh3DGl(ctx3d, meshId, (mode & MODE_SMOOTH_MASK) !== 0,
+                                  backend === MODE_BACKEND_CANVAS_ZBUF)) {
+                return;
+            }
+            // WebGL2 unavailable — fall through to software rather than draw nothing.
+        }
+        ctx3d.drawMesh3D(meshId, mode);
+        this.blit3D();
+    }
+
+    /**
+     * Canvas backend: rasterize on the GPU and composite the result.
+     *
+     * Returns false if WebGL2 is not available, so the caller can fall back to software. Each
+     * mesh composites immediately rather than batching to the end of the pass, because the 3D
+     * content has to interleave correctly with the 2D drawing around it — a document that
+     * draws a mesh, then a label, then another mesh expects that order.
+     */
+    private drawMesh3DGl(ctx3d: SoftwarePaint3DContext, meshId: number,
+                         smooth: boolean, useDepth: boolean): boolean {
+        if (this.d3gl === null) this.d3gl = new WebGL3DRenderer();
+        const gl = this.d3gl;
+        if (!gl.isAvailable()) return false;
+
+        const n = ctx3d.buildCanvasVertices(meshId, this.d3glMesh, smooth);
+        if (n < 3) return true;   // nothing survived culling; not a failure
+
+        // (GL has its own MSAA: it renders at the window size, not the supersampled one.)
+        const k = this.d3Super;
+        const w = ctx3d.getWidth() / k, h = ctx3d.getHeight() / k;
+        gl.beginFrame(w, h);
+        const tex = ctx3d.getTextureData();
+        gl.setTexture(tex.pixels, tex.width, tex.height);
+        gl.draw(this.d3glMesh, useDepth);
+        this.ctx.drawImage(gl.getCanvas(), 0, 0, w, h);
+        this.d3glDirty = true;
+        // Published so a harness can assert the GPU path ran. A silent fall back to software
+        // produces a correct-looking image, so "it rendered" proves nothing on its own.
+        (globalThis as unknown as { __rcGl3dDraws?: number }).__rcGl3dDraws = gl.drawCount;
+        return true;
+    }
+
+    /**
+     * Composite the software color buffer onto the canvas. The reference blits after every
+     * software mesh rather than once per pass, so a 3D draw interleaves with 2D content in
+     * document order; matching that keeps mixed 2D/3D documents looking the same.
+     */
+    private blit3D(): void {
+        const ctx3d = this.d3;
+        const blit = this.d3Blit;
+        if (ctx3d === null || blit === null) {
+            return;
+        }
+        const argb = ctx3d.getColorBuffer();
+        if (argb === null) {
+            return;
+        }
+        const w = ctx3d.getWidth();
+        const h = ctx3d.getHeight();
+        const img = blit.createImageData(w, h);
+        const d = img.data;
+        for (let i = 0; i < w * h; i++) {
+            const p = argb[i];
+            d[i * 4] = (p >>> 16) & 0xFF;
+            d[i * 4 + 1] = (p >>> 8) & 0xFF;
+            d[i * 4 + 2] = p & 0xFF;
+            d[i * 4 + 3] = (p >>> 24) & 0xFF;
+        }
+        blit.putImageData(img, 0, 0);
+        // Drawn under the live transform, matching the reference's Canvas.drawBitmap(b, 0, 0);
+        // a supersampled buffer is scaled down to the window with smoothing.
+        const k = this.d3Super;
+        if (k === 1) {
+            this.ctx.drawImage(blit.canvas as unknown as CanvasImageSource, 0, 0);
+        } else {
+            const smooth = this.ctx.imageSmoothingEnabled, q = this.ctx.imageSmoothingQuality;
+            this.ctx.imageSmoothingEnabled = true;
+            this.ctx.imageSmoothingQuality = 'high';
+            this.ctx.drawImage(blit.canvas as unknown as CanvasImageSource, 0, 0, w / k, h / k);
+            this.ctx.imageSmoothingEnabled = smooth;
+            this.ctx.imageSmoothingQuality = q;
+        }
+    }
+
+}
