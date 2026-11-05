@@ -119,7 +119,6 @@ export class ParticlesCreateOp extends Operation implements VariableSupport {
     private mEquations: Int32Array[];
     private mOutEquations: Int32Array[];
     private mParticles: number[][];
-    private mInitialized = false;
     private mContext: RemoteContext | null = null;
 
     constructor(id: number, particleCount: number, varId: number[], equations: Int32Array[]) {
@@ -151,13 +150,15 @@ export class ParticlesCreateOp extends Operation implements VariableSupport {
         }
     }
 
+    // Every paint initialises the particles again, as the reference does (ParticlesCreate.paint).
+    // A system that persists is created in an impulse, which applies it once when its window
+    // opens, and moved in the impulse's ImpulseProcess; as a plain command it restarts every frame.
     apply(context: RemoteContext): void {
-        if (context.mMode === ContextMode.PAINT && !this.mInitialized) {
+        if (context.mMode === ContextMode.PAINT) {
             this.mContext = context;
             for (let i = 0; i < this.mParticleCount; i++) {
                 this.initializeParticle(i, context);
             }
-            this.mInitialized = true;
         }
     }
 
