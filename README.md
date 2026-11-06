@@ -1,5 +1,9 @@
 # kobento-ts — the Kobento TypeScript player
 
+> Part of [Kobento](https://mcp.kobento.dev/), an independent implementation of RemoteCompose, not affiliated
+> with Google. [How the repositories fit together](https://mcp.kobento.dev/about/) ·
+> [Status and known gaps](https://mcp.kobento.dev/status/)
+
 > The JSON → .rc converter (json2rc), which used to live in `src/json2rc`, is in
 > [kobento-tools](https://github.com/camaelon/kobento-tools) (`json2rc/`). Tools here that
 > convert JSON (`live/`, `tests/host_api_test.mjs`) find it in the sibling checkout
