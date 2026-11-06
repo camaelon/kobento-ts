@@ -5,7 +5,7 @@ import { SoftwarePaint3DContext, createCanvasMesh } from '../core/d3/SoftwarePai
 import type { CanvasMesh } from '../core/d3/SoftwarePaint3DContext';
 import { WebGL3DRenderer } from './WebGL3DRenderer';
 import {
-    MODE_BACKEND_CANVAS, MODE_BACKEND_CANVAS_ZBUF, MODE_BACKEND_GL,
+    MODE_BACKEND_CANVAS, MODE_BACKEND_CANVAS_ZBUF, MODE_BACKEND_GL, MODE_BACKEND_SOFTWARE,
     MODE_SMOOTH_MASK, MODE_WIREFRAME,
 } from '../core/d3/Paint3DContext';
 import type { RemoteContext } from '../core/RemoteContext';
@@ -2349,6 +2349,19 @@ export class CanvasPaintContext extends PaintContext {
     static supersample3D: number | 'auto' = 1;
     supersample3D: number | 'auto' = CanvasPaintContext.supersample3D;
 
+    /**
+     * Draw the software modes (0/1, software flat and smooth) on the GL backend when WebGL2 is
+     * there, as if the document had asked for modes 6/7. Documents mostly say "flat" or
+     * "smooth" and mean "draw it"; on a web page the software rasterizer costs a whole frame
+     * for a scene the GPU draws in a millisecond (a 68-mesh engine at 1225x932: 2 fps against
+     * 31). The picture differs from software only by GL_DIVERGENCES (WebGL3DRenderer.ts).
+     * Wireframe stays software (it needs the depth buffer the software path owns), and so
+     * does everything when WebGL2 is unavailable. False keeps the software path for modes
+     * 0/1 (a parity test's reference). RC.CanvasPaintContext.gpuForSoftware3D, or per context.
+     */
+    static gpuForSoftware3D = true;
+    gpuForSoftware3D: boolean = CanvasPaintContext.gpuForSoftware3D;
+
     private superFactor(): number {
         const v = this.supersample3D;
         if (v === 'auto') return this.ctx.canvas.width * this.ctx.canvas.height <= 1_050_000 ? 2 : 1;
@@ -2466,8 +2479,9 @@ export class CanvasPaintContext extends PaintContext {
 
         // Wireframe is hidden-line and needs the depth buffer the software path owns, so the
         // contract forces software regardless of the backend bits.
-        const backend = mode >> 1;
+        let backend = mode >> 1;
         const wire = (mode & MODE_WIREFRAME) !== 0;
+        if (backend === MODE_BACKEND_SOFTWARE && this.gpuForSoftware3D) backend = MODE_BACKEND_GL;
         if (!wire && backend === MODE_BACKEND_GL) {
             if (this.drawMesh3DModelSpace(ctx3d, meshId, (mode & MODE_SMOOTH_MASK) !== 0)) {
                 return;

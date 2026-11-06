@@ -17,7 +17,7 @@ import type { RemoteContext } from '../../RemoteContext';
 import type { VariableSupport } from '../../VariableSupport';
 import type { WireBuffer } from '../../WireBuffer';
 import { isVariableBits, idFromBits, intBitsToFloat } from '../Utils';
-import { isPaint3DContext, P3_CLEAR_DEPTH, P3_MATERIAL, P3_DEPTH_BIAS } from '../../d3/Paint3DContext';
+import { isPaint3DContext, P3_CLEAR_DEPTH, P3_MATERIAL, P3_DEPTH_BIAS, MODE_WIREFRAME } from '../../d3/Paint3DContext';
 import { build as buildPrimitive, MeshData } from '../../d3/Primitive3D';
 
 /** Guards against a malformed or hostile document allocating unbounded buffers. */
@@ -595,4 +595,28 @@ export class MeshPrimitive extends PaintOperation implements VariableSupport {
         }
         operations.push(new MeshPrimitive(id, type, segments, flags, data));
     }
+}
+
+/**
+ * True when the document draws any mesh as a wireframe. Wireframe is hidden-line drawn
+ * against the software depth buffer, so a scene that also puts its faces on the GPU would
+ * lose the faces from that buffer: edges behind other meshes would show, and the GPU's
+ * pictures would land over the software ones whatever their depth. The web player keeps
+ * such a document's software modes on software (CanvasPaintContext.gpuForSoftware3D).
+ * Walks every operation list in the tree (containers, components, canvas commands) once.
+ */
+export function drawsWireframe3D(ops: readonly unknown[]): boolean {
+    const seen = new Set<object>();
+    const visit = (x: unknown): boolean => {
+        if (x === null || typeof x !== 'object' || seen.has(x)) return false;
+        seen.add(x);
+        if (x instanceof DrawMesh3D) return (x.mMode & MODE_WIREFRAME) !== 0;
+        if (Array.isArray(x)) return x.some(visit);
+        if (!(x instanceof Operation)) return false;
+        for (const v of Object.values(x)) {
+            if ((Array.isArray(v) || v instanceof Operation) && visit(v)) return true;
+        }
+        return false;
+    };
+    return visit(ops);
 }

@@ -120,6 +120,8 @@ const DOCS = {{
   sw: "{base64.b64encode(RC_SW.read_bytes()).decode()}",
   gl: "{base64.b64encode(RC_GL.read_bytes()).decode()}"
 }};
+// The software document (mode 1) must stay software: the player draws modes 0/1 on GL by default.
+RC.CanvasPaintContext.gpuForSoftware3D = false;
 function bytes(b64) {{
   const s = atob(b64), a = new Uint8Array(s.length);
   for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);

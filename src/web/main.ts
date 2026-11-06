@@ -8,6 +8,7 @@ import { WebRemoteContext } from './WebRemoteContext';
 import { ContextMode, RemoteContext } from '../core/RemoteContext';
 import { Header } from '../core/operations/Header';
 import { Theme } from '../core/operations/DataOperations';
+import { drawsWireframe3D } from '../core/operations/d3/Operations3D';
 import type { MeasurementSink } from '../core/OperationMeasurement';
 import { WebCustomHost, type EmbedResolver } from './CustomHosts';
 
@@ -313,6 +314,11 @@ export class RcdPlayer {
         // animated bitmap holds.
         if (this.paintContext) this.paintContext.dispose();
         this.paintContext = new CanvasPaintContext(null as any, this.ctx);
+        // A document that draws wireframes keeps its software 3D on software: hidden-line edges
+        // need every face in the software depth buffer (drawsWireframe3D).
+        if (this.paintContext.gpuForSoftware3D && drawsWireframe3D(doc.getOperations())) {
+            this.paintContext.gpuForSoftware3D = false;
+        }
         this.paintContext.setBitmapVideos(this.bitmapVideos);
         this.remoteContext = new WebRemoteContext(this.paintContext);
 
@@ -542,6 +548,8 @@ export class RcdPlayer {
 // Re-export public API
 import { createPlayer, RcPlayerElement, base64ToArrayBuffer } from './RcPlayerElement';
 export { createPlayer, RcPlayerElement, base64ToArrayBuffer };
+// Its static switches (supersample3D, gpuForSoftware3D) set every player's default.
+export { CanvasPaintContext };
 export { WebCustomHost, parseEmbedConfig, fitInto } from './CustomHosts';
 export { pinClock } from '../core/ClockPin';
 export { createHostApi } from './HostApi';
