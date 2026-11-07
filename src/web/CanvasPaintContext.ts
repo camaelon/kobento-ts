@@ -450,7 +450,7 @@ export class CanvasPaintContext extends PaintContext {
         // a different cache. Without this a document that renders into a buffer with
         // `drawToBitmap` and then blits it with `drawBitmap` draws nothing at all: the id
         // resolves, the lookup misses, and the draw silently returns. The shader path
-        // already consults this cache first (see the texture uniforms in tryRenderShader),
+        // already consults this cache first (see the texture uniforms in shaderPattern),
         // so before this the same buffer was reachable from a shader but not from a blit.
         const offscreen = this.bitmapCanvasCache.get(imageId);
         if (offscreen) return offscreen.canvas as CanvasImageSource;
@@ -765,13 +765,15 @@ export class CanvasPaintContext extends PaintContext {
     }
 
     private applyFillStyle(override?: CanvasGradient | CanvasPattern | null): void {
-        this.ctx.fillStyle = override ?? this.getEffectiveColor();
+        // A runtime shader paints whatever is filled, as in Skia (shaderPattern).
+        this.ctx.fillStyle = override ?? (this.activeShaderData ? this.shaderPattern() : null) ?? this.getEffectiveColor();
         this.ctx.globalAlpha = this.alpha * this.mLayerAlpha;
         this.ctx.globalCompositeOperation = this.blendMode;
     }
 
     private applyStrokeStyle(override?: CanvasGradient | CanvasPattern | null): void {
-        this.ctx.strokeStyle = override ?? this.getEffectiveColor();
+        // ... and whatever is stroked, its width, caps and joins included.
+        this.ctx.strokeStyle = override ?? (this.activeShaderData ? this.shaderPattern() : null) ?? this.getEffectiveColor();
         this.ctx.lineWidth = this.strokeWidth;
         this.ctx.lineCap = this.lineCap;
         this.ctx.lineJoin = this.lineJoin;
@@ -1188,35 +1190,37 @@ export class CanvasPaintContext extends PaintContext {
         }
     }
 
-    /**
-     * If an active shader is set, render it via WebGL2 into the given
-     * rectangle and return true. Otherwise return false (caller does
-     * the normal fill).
-     */
-    private tryRenderShader(left: number, top: number, right: number, bottom: number): boolean {
-        const ctx = this.getContext();
-        if (!this.activeShaderData || !ctx) return false;
-        const sd = this.activeShaderData;
+    /** The last shader pattern, reused while the shader, its uniforms and the transform stay the same. */
+    private shaderPatternCache: { key: string; pattern: CanvasPattern } | null = null;
 
-        // Get shader source text
+    /**
+     * The active runtime shader as a pattern, or null when there is none or it cannot run here.
+     *
+     * Skia evaluates a runtime shader at the local coordinates of whatever is drawn (a rect, a
+     * path's fill, a stroke with its width, caps and joins, a glyph), so the shader is rendered
+     * over the part of local space the canvas shows and every fill and stroke paints with it.
+     * Transparent output stays transparent: the shape is not filled with the paint's colour.
+     * (Only drawRect used to render the shader, at the rect with p from 0: a stroked path, a
+     * circle or a line drew in the paint's plain colour instead.)
+     */
+    private shaderPattern(): CanvasPattern | null {
+        const ctx = this.getContext();
+        const sd = this.activeShaderData;
+        if (!sd || !ctx || typeof this.ctx.getTransform !== 'function') return null;
+
         const textId = sd.getShaderTextId();
         const shaderText = this.textCache.get(textId);
-        if (!shaderText) return false;
-
-        // Transpile (cached by string textId)
-        const cacheKey = String(textId);
+        if (!shaderText) return null;
         let glsl = this.glslCache.get(textId);
         if (!glsl) {
             try {
-                const result = transpileAgslToGlsl(shaderText);
-                glsl = result.glsl;
+                glsl = transpileAgslToGlsl(shaderText).glsl;
                 this.glslCache.set(textId, glsl);
             } catch (e) {
                 console.error(`[shader] transpile failed (textId=${textId}):`, e, '\nAGSL:', shaderText);
-                return false;
+                return null;
             }
         }
-
         // One renderer per document. Sharing a single renderer page-wide looks
         // tempting (a browser allows only ~16 live WebGL contexts) but is wrong: the
         // renderer draws into its own offscreen canvas, so documents sharing one read
@@ -1226,38 +1230,34 @@ export class CanvasPaintContext extends PaintContext {
             this.shaderRenderer = new WebGLShaderRenderer();
             if (!this.shaderRenderer.isAvailable()) {
                 this.shaderRenderer = null;
-                return false;
+                return null;
             }
         }
 
-        let w = Math.round(right - left);
-        let h = Math.round(top > bottom ? top - bottom : bottom - top);
-        if (w <= 0 || h <= 0) return false;
+        // The canvas's pixels in local coordinates: its corners through the inverse transform.
+        const m = this.ctx.getTransform();
+        const det = m.a * m.d - m.b * m.c;
+        if (!det) return null;
+        const inv = m.inverse();
+        const cw = this.ctx.canvas.width || 1, ch = this.ctx.canvas.height || 1;
+        const xs: number[] = [], ys: number[] = [];
+        for (const [x, y] of [[0, 0], [cw, 0], [0, ch], [cw, ch]]) {
+            xs.push(inv.a * x + inv.c * y + inv.e);
+            ys.push(inv.b * x + inv.d * y + inv.f);
+        }
+        const bx = Math.min(...xs), by = Math.min(...ys);
+        const bw = Math.max(...xs) - bx, bh = Math.max(...ys) - by;
+        if (!(bw > 0 && bh > 0)) return null;
+        // Rendered at the device's resolution (pixels per local unit), within reason.
+        const scale = Math.sqrt(Math.abs(det));
+        const w = Math.max(1, Math.min(4096, Math.ceil(bw * scale)));
+        const h = Math.max(1, Math.min(4096, Math.ceil(bh * scale)));
 
-        // Cap to actual canvas size — avoid creating absurdly large WebGL
-        // surfaces for documents taller/wider than the viewport.
-        const maxW = this.ctx.canvas.width || 4096;
-        const maxH = this.ctx.canvas.height || 4096;
-        if (w > maxW) w = maxW;
-        if (h > maxH) h = maxH;
-
-        // Resolve NaN-encoded uniform IDs to current values
         sd.updateVariables(ctx);
-
-        // Collect float uniforms
         const floats = new Map<string, Float32Array>();
-        for (const name of sd.getUniformFloatNames()) {
-            const vals = sd.getUniformFloats(name);
-            floats.set(name, vals);
-        }
-
-        // Collect int uniforms
+        for (const name of sd.getUniformFloatNames()) floats.set(name, sd.getUniformFloats(name));
         const ints = new Map<string, Int32Array>();
-        for (const name of sd.getUniformIntegerNames()) {
-            ints.set(name, sd.getUniformInts(name));
-        }
-
-        // Collect texture uniforms
+        for (const name of sd.getUniformIntegerNames()) ints.set(name, sd.getUniformInts(name));
         let textures: Map<string, TexImageSource> | undefined;
         const bitmapNames = sd.getUniformBitmapNames();
         if (bitmapNames.length > 0) {
@@ -1266,44 +1266,37 @@ export class CanvasPaintContext extends PaintContext {
                 const bmpId = sd.getUniformBitmapId(name);
                 if (bmpId < 0) continue;
                 const offCtx = this.bitmapCanvasCache.get(bmpId);
-                if (offCtx) {
-                    textures.set(name, offCtx.canvas as any);
-                } else {
+                if (offCtx) textures.set(name, offCtx.canvas as any);
+                else {
                     const img = this.bitmapCache.get(bmpId);
                     if (img) textures.set(name, img);
                 }
             }
         }
 
-        // Render via WebGL — pass document rect size for coordinate scaling
-        const docW = Math.round(right - left);
-        const docH = Math.round(Math.abs(bottom - top));
-        const ok = this.shaderRenderer.render(
-            glsl, w, h, floats, ints, textures, cacheKey, docW, docH);
+        // The same shader, uniforms and area as the last draw: the same pattern (a frame
+        // often fills and strokes several shapes with one shader).
+        const key = textures ? '' : [textId, bx, by, bw, bh, w, h,
+            ...[...floats].map(([n, v]) => `${n}=${Array.from(v).join(',')}`),
+            ...[...ints].map(([n, v]) => `${n}=${Array.from(v).join(',')}`)].join('|');
+        if (key && this.shaderPatternCache?.key === key) return this.shaderPatternCache.pattern;
+
+        const ok = this.shaderRenderer.render(glsl, w, h, floats, ints, textures, String(textId), bw, bh, bx, by);
         if (!ok) {
             console.error(`[shader] WebGL render FAILED textId=${textId}`);
-            return false;
+            return null;
         }
-
-        // Composite into Canvas2D at the original document rect (the canvas
-        // transform handles scaling from document coords to screen pixels).
-        this.ctx.globalAlpha = this.alpha * this.mLayerAlpha;
-        this.ctx.globalCompositeOperation = this.blendMode;
-        const dstW = right - left;
-        const dstH = Math.abs(bottom - top);
-        this.ctx.drawImage(this.shaderRenderer.getCanvas(),
-                           left, Math.min(top, bottom), dstW, dstH);
-        return true;
+        // (A pattern copies its source when it is made, so the renderer's canvas can be reused.)
+        const pattern = this.ctx.createPattern(this.shaderRenderer.getCanvas(), 'no-repeat');
+        if (!pattern) return null;
+        pattern.setTransform(new DOMMatrix([bw / w, 0, 0, bh / h, bx, by]));
+        this.shaderPatternCache = key ? { key, pattern } : null;
+        return pattern;
     }
 
     // --- Drawing ---
 
     drawRect(left: number, top: number, right: number, bottom: number): void {
-        // If an AGSL shader is active, render it via WebGL2 instead of the
-        // normal Canvas2D fill.  Falls back to regular fill on failure.
-        if (this.activeShaderData && this.tryRenderShader(left, top, right, bottom)) {
-            return;
-        }
         this.fillOrStroke(
             () => { this.ctx.fillRect(left, top, right - left, bottom - top); },
             () => { this.ctx.strokeRect(left, top, right - left, bottom - top); }

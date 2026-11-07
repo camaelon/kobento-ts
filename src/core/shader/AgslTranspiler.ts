@@ -180,9 +180,10 @@ export function transpileAgslToGlsl(agslSource: string): TranspileResult {
                 i = braceIdx;
                 if (i < n && tokens[i].type === TokenType.Punctuation && tokens[i].value === '{') {
                     out.push(' {\n');
-                    // Scale from render pixels to document coordinates.
-                    // gl_FragCoord is in [0, u_resolution], we need [0, u_doc_size].
-                    out.push(`  vec2 ${mainParamName} = vec2(gl_FragCoord.x, u_resolution.y - gl_FragCoord.y) * u_doc_size / u_resolution;\n`);
+                    // Scale from render pixels to the draw's local coordinates, as Skia
+                    // evaluates a runtime shader: gl_FragCoord is in [0, u_resolution], the
+                    // rendered area is [u_doc_origin, u_doc_origin + u_doc_size].
+                    out.push(`  vec2 ${mainParamName} = u_doc_origin + vec2(gl_FragCoord.x, u_resolution.y - gl_FragCoord.y) * u_doc_size / u_resolution;\n`);
                     inMain = true;
                     mainBraceDepth = 1;
                     i++;
@@ -264,6 +265,7 @@ export function transpileAgslToGlsl(agslSource: string): TranspileResult {
     let glsl = '#version 300 es\nprecision highp float;\n';
     glsl += 'uniform vec2 u_resolution;\n';   // actual WebGL render size (pixels)
     glsl += 'uniform vec2 u_doc_size;\n';     // document rect size (for coord scaling)
+    glsl += 'uniform vec2 u_doc_origin;\n';   // its top-left, in the draw's local coordinates
     glsl += 'out vec4 fragColor;\n';
     glsl += out.join('');
 

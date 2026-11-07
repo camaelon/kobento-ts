@@ -100,7 +100,7 @@ half4 main(float2 fc) {
     // Helper function should keep float return type and have vec2 param
     assertContains(r.glsl, 'float hash(vec2 p)', 'helper signature');
     assertContains(r.glsl, 'void main()', 'main rewritten');
-    assertContains(r.glsl, 'vec2 fc = vec2(gl_FragCoord.x', 'param injection');
+    assertContains(r.glsl, 'vec2 fc = u_doc_origin + vec2(gl_FragCoord.x', 'param injection');
     // The return in hash() should NOT be rewritten to fragColor
     assertContains(r.glsl, 'return fract(', 'helper return untouched');
     // The return in main() SHOULD be rewritten

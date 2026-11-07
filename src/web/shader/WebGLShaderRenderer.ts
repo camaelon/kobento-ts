@@ -72,6 +72,8 @@ export class WebGLShaderRenderer {
         cacheKey?: string,
         docWidth?: number,
         docHeight?: number,
+        docX = 0,
+        docY = 0,
     ): boolean {
         const gl = this.initGL();
         if (!gl) return false;
@@ -100,6 +102,8 @@ export class WebGLShaderRenderer {
         if (resLoc) gl.uniform2f(resLoc, width, height);
         const docLoc = this.getUniformLoc(gl, cached, 'u_doc_size');
         if (docLoc) gl.uniform2f(docLoc, docWidth ?? width, docHeight ?? height);
+        const originLoc = this.getUniformLoc(gl, cached, 'u_doc_origin');
+        if (originLoc) gl.uniform2f(originLoc, docX, docY);
 
         // Bind float uniforms
         if (floats) {
